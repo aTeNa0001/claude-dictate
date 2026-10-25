@@ -29,11 +29,9 @@ try {
 
 $text = [string]$data.prompt
 
-# Let slash commands (/voice, /config, /login ...) through untouched.
-if ($text.TrimStart().StartsWith('/')) {
-    Write-Log "pass-through: $text"
-    exit 0
-}
+# Nothing gets through, slash commands included: Claude Code hands skills and
+# custom commands (/deploy staging) to this hook before running them, so a
+# pass-through for "/" would let them run in the dictation instance.
 
 if ([string]::IsNullOrWhiteSpace($text)) {
     Write-Log 'empty prompt'

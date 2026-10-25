@@ -1,16 +1,19 @@
 {
   "language": "ru",
+  "tui": "default",
   "voice": {
     "enabled": true,
     "mode": "tap"
   },
+  "disableAllHooks": false,
   "hooks": {
     "UserPromptSubmit": [
       {
         "hooks": [
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File hook-grab.ps1"
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File hook-grab.ps1",
+            "onFailure": "block"
           }
         ]
       }

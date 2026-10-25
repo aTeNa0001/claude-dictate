@@ -18,8 +18,8 @@ A small AutoHotkey utility, no build, no dependencies.
 
 - Windows 10/11.
 - [AutoHotkey v2](https://www.autohotkey.com/).
-- [Claude Code](https://code.claude.com/) 2.1.116 or newer (tap-mode dictation). The
-  standard installer puts `claude.exe` in PATH, which is enough; otherwise set `claudeExe`
+- [Claude Code](https://code.claude.com/) 2.1.295 or newer (tap-mode dictation, `onFailure`
+  for hooks). The standard installer puts `claude.exe` in PATH, which is enough; otherwise set `claudeExe`
   in `dictate.ini`. Signed in with a claude.ai account on a Pro/Max/Team/Enterprise
   plan; dictation is not available with an API key.
 - A microphone that desktop apps are allowed to use (Windows privacy settings).
@@ -112,21 +112,31 @@ On every start the launcher takes the first that applies:
 ## How it works
 
 1. `dictate-core.ahk` runs `claude --settings dictate-settings.json` in a classic console
-   (not Windows Terminal, which ignores keys posted to its window) and posts keys into it
-   with `ControlSend`, without taking the focus.
+   (not Windows Terminal, which ignores keys posted to its window) and posts Space, Enter
+   and Escape into it with `ControlSend`, without taking the focus.
 2. `dictate-settings.json` enables tap-mode dictation and installs a `UserPromptSubmit` hook.
    The file is passed only to this instance; global Claude Code settings are untouched.
+   If the hook fails to run, the prompt is blocked anyway (`"onFailure": "block"`), and
+   `"disableAllHooks": false` keeps a profile from switching the hook off.
 3. `hook-grab.ps1` receives the submitted prompt, writes it to `dictate-out.txt` and exits
-   with code 2: the prompt is blocked, the model never sees it.
+   with code 2: the prompt is blocked, the model never sees it. Slash commands are captured
+   too, so a skill typed into that console does not run; run `/login` and other commands
+   in an ordinary Claude Code window with the same profile.
 4. The script waits for the file, pastes the text via the clipboard and restores the old clipboard.
-5. The real microphone state is read from the Windows registry
-   (`CapabilityAccessManager\ConsentStore\microphone`); otherwise an empty recording
-   cannot be told apart from a running one. The record is keyed by the executable path,
-   and Claude Code's auto-update renames the running binary to `claude.exe.old.<n>`
-   without a word, so the path is asked from the running process each time
-   (`QueryFullProcessImageName`) rather than taken from the settings. When that path
-   stops matching the one seen at start, the script knows Claude Code has updated and
-   turns the indicator yellow.
+   Claude Code puts a blocked prompt back into its input, so the script erases it with
+   Ctrl+U written straight into the console's input buffer (`WriteConsoleInput`); posted
+   with `ControlSend` to a console without the focus, Ctrl+U arrives as a plain "u".
+   The input is erased the same way before every recording starts.
+5. The real microphone state is asked from the Windows audio system (Core Audio): while
+   Claude Code records, its process has an active audio session on the microphone.
+   Otherwise an empty recording cannot be told apart from a running one.
+6. Claude Code's auto-update renames the running binary to `claude.exe.old.<n>` without
+   a word. The script asks the running process for its path once a minute
+   (`QueryFullProcessImageName`); when it stops matching the one seen at start, the
+   indicator turns yellow.
+7. `dictate-settings.json` pins the display mode (`"tui": "default"`), so the dictation
+   instance looks the same in every profile and no startup offer to switch modes catches
+   the keys.
 
 ## Limitations
 

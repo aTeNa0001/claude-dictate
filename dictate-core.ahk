@@ -53,6 +53,7 @@ global OutFile     := A_ScriptDir "\dictate-out.txt"
 global LogFile     := A_ScriptDir "\dictate.log"      ; shared with the hook
 global DictHwnd    := 0        ; window handle of the Claude Code console
 global Recording   := false
+global Busy        := false    ; a stopped recording is being collected and pasted
 global RecStartTick := 0       ; A_TickCount when the current recording started
 global MicSeen     := false    ; the microphone was observed in use during this recording
 global ClaudePid   := 0        ; process id of claude.exe inside that console
@@ -77,8 +78,9 @@ FindClaudeExe() {
         if (dir != "" && FileExist(dir "\claude.exe"))
             return dir "\claude.exe"
     }
-    if FileExist(A_MyDocuments "\..\.local\bin\claude.exe")
-        return A_MyDocuments "\..\.local\bin\claude.exe"
+    path := EnvGet("USERPROFILE") "\.local\bin\claude.exe"
+    if FileExist(path)
+        return path
     return ""
 }
 if (ConfigDir != "" && !DirExist(ConfigDir)) {
@@ -94,9 +96,8 @@ A_IconTip := "claude-dictate (" (ConfigDir != "" ? ConfigDir : "default config")
 CreateTrayMenu()      ; before StartClaudeWindow: ApplyWindowMode marks the menu
 OnExit CloseClaudeWindow   ; registered first, so any later failure still closes Claude Code
 
-; Hotkeys are live from the moment the script loads, so the indicator must
-; exist before the slow part (starting Claude Code) and the hotkey must wait.
-global Ready := false
+; The indicator shows "starting" during the slow part (starting Claude Code);
+; the hotkeys are registered only after it.
 IndState.text := "… starting"
 IndState.color := "E0B050"
 CreateIndicator()
@@ -107,7 +108,6 @@ if !StartClaudeWindow() {
     ExitApp
 }
 
-Ready := true
 IndicatorIdle()
 
 ; Hotkeys come from dictate.ini (AutoHotkey notation: ^ Ctrl, + Shift, ! Alt, # Win).
@@ -352,29 +352,58 @@ StopRecClock() {
     SetTimer RecTick, 0
 }
 
-; Is Claude Code recording right now? Windows keeps a per-app microphone usage
-; record in the registry (the same data drives the tray microphone icon):
-; LastUsedTimeStop = 0 means the app is using the microphone at this moment.
-; The record is keyed by the current path of the running binary, so that path
-; is asked from the process itself (see ClaudeImagePath), not taken from claudeExe.
-; The value is a 64-bit FILETIME, which RegRead cannot read, hence RegGetValue.
+; Is Claude Code recording right now? Asked from the Windows audio system (Core
+; Audio): every program that records gets an audio session on the microphone,
+; and the session is active (state 1) while it is recording. True if any active
+; microphone has an active session of the Claude Code process.
+; Not the registry record behind the tray microphone icon (ConsentStore\microphone):
+; since the Windows updates of October 2026 it is no longer written for
+; ordinary (non-Store) programs.
 MicInUse() {
-    path := ClaudeImagePath()
-    if (path = "")
+    if !ClaudePid
         return false
-    sub := "Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone\NonPackaged\" StrReplace(path, "\", "#")
-    val := 0
-    size := 8
-    rc := DllCall("advapi32\RegGetValueW", "ptr", 0x80000001, "str", sub, "str", "LastUsedTimeStop"
-        , "uint", 0x40, "ptr", 0, "int64*", &val, "uint*", &size, "int")   ; HKCU, RRF_RT_REG_QWORD
-    return (rc = 0 && val = 0)
+    ; Every interface pointer goes into a ComValue(13, 0) wrapper, which releases
+    ; it when the wrapper is freed, also when a call fails halfway. A microphone
+    ; that fails (unplugged during the loop) is skipped and the others are still
+    ; checked, so one bad device does not read as "Claude Code stopped recording".
+    try {
+        ; IMMDeviceEnumerator::EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE)
+        deviceEnumerator := ComObject("{BCDE0395-E52F-467C-8E3D-C4579291692E}", "{A95664D2-9614-4F35-A746-DE8DB63617E6}")
+        devices := ComValue(13, 0)
+        ComCall(3, deviceEnumerator, "int", 1, "uint", 1, "ptr*", devices)
+        ComCall(3, devices, "uint*", &deviceCount := 0)
+        managerIid := Buffer(16)
+        DllCall("ole32\CLSIDFromString", "str", "{77AA99A0-1BD6-484F-8BC7-2C654C9A9B6F}", "ptr", managerIid)   ; IAudioSessionManager2
+        Loop deviceCount {
+            deviceIndex := A_Index - 1
+            try {
+                device := ComValue(13, 0)
+                ComCall(4, devices, "uint", deviceIndex, "ptr*", device)                     ; Item
+                manager := ComValue(13, 0)
+                ComCall(3, device, "ptr", managerIid, "uint", 23, "ptr", 0, "ptr*", manager)   ; Activate
+                sessions := ComValue(13, 0)
+                ComCall(5, manager, "ptr*", sessions)                                       ; GetSessionEnumerator
+                ComCall(3, sessions, "int*", &sessionCount := 0)
+                Loop sessionCount {
+                    control := ComValue(13, 0)
+                    ComCall(4, sessions, "int", A_Index - 1, "ptr*", control)               ; GetSession
+                    ComCall(3, control, "int*", &state := 0)                                ; GetState
+                    control2 := ComObjQuery(control, "{bfb7ff88-7239-4fc9-8fa2-07c950be9c6d}")   ; IAudioSessionControl2
+                    ComCall(14, control2, "uint*", &sessionPid := 0)                        ; GetProcessId
+                    if (sessionPid = ClaudePid && state = 1)
+                        return true
+                }
+            }
+        }
+    }
+    return false
 }
 
 ; Full path of the executable behind the running Claude Code process, as the
-; kernel sees it now. Claude Code's auto-update renames the running binary
-; (claude.exe -> claude.exe.old.<n>) and puts the new one in its place; the
-; process keeps running under the new name and Windows files its microphone
-; use under that name. WMI / Get-Process still report the original path,
+; kernel sees it now; used by the update check below. Claude Code's auto-update
+; renames the running binary (claude.exe -> claude.exe.old.<n>) and puts the
+; new one in its place; the process keeps running under the new name.
+; WMI / Get-Process still report the original path,
 ; QueryFullProcessImageName reports the current one. "" if the process is gone.
 ClaudeImagePath() {
     if !ClaudePid
@@ -407,6 +436,10 @@ CheckClaudeUpdate() {
 
 RecTick() {
     global MicSeen
+    ; A hotkey can interrupt this timer anywhere (in MicInUse above all) and
+    ; finish or cancel the recording; then the rest of this tick is stale.
+    if !Recording
+        return
     ; Claude Code stopped and submitted on its own (15 s of silence or its
     ; 2-minute cap): the hook has already written the file, so just paste it.
     if FileExist(OutFile) {
@@ -415,7 +448,10 @@ RecTick() {
         return
     }
     elapsed := (A_TickCount - RecStartTick) // 1000
-    if MicInUse() {
+    micOn := MicInUse()
+    if !Recording
+        return
+    if micOn {
         MicSeen := true
     } else if MicSeen {
         ; The microphone went off without a file: either Claude Code is still
@@ -426,7 +462,10 @@ RecTick() {
     } else if (elapsed >= 5) {
         StopRecClock()
         global Recording := false
-        LogEvent("mic never came on within 5 s")
+        ; Cancel a start that is merely slow, so the microphone does not come on
+        ; later with nobody waiting for the text.
+        SendToClaude("{Escape}")
+        LogEvent("mic never came on within 5 s, Escape sent")
         SetIndicator("No mic", "E05050", 3000)
         return
     }
@@ -450,48 +489,72 @@ RecTick() {
 ; Windows Terminal does not, which is why it is not used here.
 StartClaudeWindow() {
     global DictHwnd, ClaudePid, ClaudeStartPath, ClaudeUpdated
+    ; CLAUDE_CONFIG_DIR is set only for the Run below and put back right after:
+    ; the launcher that switches profiles is started from this process and
+    ; would otherwise hand the old profile down to a "default" core.
+    inheritedConfigDir := EnvGet("CLAUDE_CONFIG_DIR")
     if (ConfigDir != "")
         EnvSet "CLAUDE_CONFIG_DIR", ConfigDir
-    ; /voice needs a claude.ai login; make sure no API key overrides it.
+    ; /voice needs a claude.ai login; make sure no API key overrides it,
+    ; and that Claude Code is not switched to Bedrock, Vertex or Foundry,
+    ; where /voice is not available.
     EnvSet "ANTHROPIC_API_KEY", ""
     EnvSet "ANTHROPIC_AUTH_TOKEN", ""
     EnvSet "CLAUDE_CODE_OAUTH_TOKEN", ""
+    EnvSet "CLAUDE_CODE_USE_BEDROCK"
+    EnvSet "CLAUDE_CODE_USE_VERTEX"
+    EnvSet "CLAUDE_CODE_USE_FOUNDRY"
 
-    ; The new window is the ConsoleWindowClass window that was not there before.
-    before := WinGetList("ahk_class ConsoleWindowClass")
-    Run 'conhost.exe "' ClaudeExe '" --settings "' Settings '"', A_ScriptDir
+    Run 'conhost.exe "' ClaudeExe '" --settings "' Settings '"', A_ScriptDir, , &conhostPid
+    if (inheritedConfigDir != "")
+        EnvSet "CLAUDE_CONFIG_DIR", inheritedConfigDir
+    else
+        EnvSet "CLAUDE_CONFIG_DIR"
+    ; The window is found through the processes, not as "a console window that
+    ; was not there before": other programs open short-lived hidden consoles all
+    ; the time, and one of them could be taken instead. conhost runs claude.exe
+    ; as its child, and a console window reports the pid of the hosted program
+    ; (claude.exe), not of conhost, so the window is the console window of that
+    ; child. That pid is also what MicInUse and the update check work from.
+    SplitPath ClaudeExe, &exeName
     DictHwnd := 0
+    ClaudePid := 0
     Loop 150 {
-        for h in WinGetList("ahk_class ConsoleWindowClass") {
-            isOld := false
-            for b in before
-                if (b = h)
-                    isOld := true
-            if !isOld {
-                DictHwnd := h
-                break
-            }
-        }
+        if !ClaudePid
+            ClaudePid := ChildPid(conhostPid, exeName)
+        if ClaudePid
+            DictHwnd := WinExist("ahk_class ConsoleWindowClass ahk_pid " ClaudePid)
         if DictHwnd
             break
         Sleep 100
     }
-    if !DictHwnd
+    if !DictHwnd {
+        ; Close what was started, or every failed start leaves a hidden
+        ; Claude Code behind (OnExit only knows the window, and there is none).
+        if ClaudePid
+            ProcessClose ClaudePid
+        ProcessClose conhostPid
+        LogEvent("Claude Code window not found within 15 s (conhost pid " conhostPid ", " exeName " pid " ClaudePid ")")
+        ClaudePid := 0
         return false
+    }
 
     Sleep 5000   ; let Claude Code draw its prompt
     ApplyWindowMode(WindowMode)
-    ; A console window reports the pid of the hosted program (claude.exe), not
-    ; of conhost. That pid is what MicInUse and the update check work from.
-    ; The window may already be gone if Claude Code crashed on startup.
-    try ClaudePid := WinGetPID("ahk_id " DictHwnd)
-    catch
-        ClaudePid := 0
-    ClaudeStartPath := ClaudeImagePath()
+    WriteCtrlU()   ; erase what got typed into the console while it had the focus
+    ClaudeStartPath := ClaudeImagePath()   ; "" if Claude Code crashed on startup
     ClaudeUpdated := false
     SetTimer CheckClaudeUpdate, 60000
     LogEvent("Claude Code started, console hwnd " DictHwnd ", pid " ClaudePid " (" ClaudeStartPath "), config " (ConfigDir != "" ? ConfigDir : "default") ", window " WindowMode)
     return true
+}
+
+; Pid of the child process of parentPid with the given exe name, 0 if none (yet).
+ChildPid(parentPid, name) {
+    query := "SELECT ProcessId FROM Win32_Process WHERE ParentProcessId=" parentPid " AND Name='" name "'"
+    for process in ComObjGet("winmgmts:").ExecQuery(query)
+        return process.ProcessId
+    return 0
 }
 
 ClaudeWindowAlive() {
@@ -524,8 +587,8 @@ LogEvent(msg) {
 
 ToggleDictation() {
     global Recording, TargetHwnd
-    if !Ready
-        return      ; still starting Claude Code
+    if Busy
+        return      ; the previous recording is still being collected and pasted
     if !Recording {
         try TargetHwnd := WinGetID("A")
         catch
@@ -536,6 +599,10 @@ ToggleDictation() {
             SetIndicator("No Claude", "E05050", 3000)
             return
         }
+        ; Anything left in Claude Code's input (a prompt it put back after a
+        ; failed paste, keys typed into the visible console) would turn the
+        ; Space into a typed space instead of the start of a recording.
+        WriteCtrlU()
         SendToClaude("{Space}")
         Recording := true
         StartRecClock()
@@ -552,49 +619,71 @@ TargetTitle() {
 }
 
 ; Second press (or the countdown reaching zero): stop, wait for the hook, paste.
+; Every way a recording ends sets Busy until the text is pasted and Claude Code's
+; input erased: a Ctrl+Space pressed meanwhile is ignored instead of starting a
+; new recording on top (it would take over TargetHwnd and delete the hook file).
+; The countdown and the self-stop paths run from the RecTick timer, which a
+; hotkey can interrupt, so the per-hotkey thread limit does not cover them.
 FinishDictation() {
-    global Recording
+    global Recording, Busy
     Recording := false
-    StopRecClock()
-    SetIndicator("… process", "E0B050")
-    if !ClaudeWindowAlive() {
-        LogEvent("stop failed: Claude Code window is gone")
-        SetIndicator("No Claude", "E05050", 3000)
-        return
-    }
-    ; Only stop the recording if it is still running. If Claude Code already
-    ; stopped by itself, a Space on an empty prompt would start a new recording.
-    if MicInUse()
-        SendToClaude("{Space}")
-    else
-        LogEvent("mic already off, Space not sent")
-    ; Claude Code auto-submits transcripts of 3+ words. Shorter ones stay
-    ; in the input, so if nothing arrives we press Enter once and wait again.
-    text := WaitForText(6000)
-    if (text = "") {
-        LogEvent("no text after 6 s, sending Enter")
-        SendToClaude("{Enter}")
-        text := WaitForText(6000)
-    }
-    DeliverText(text, "No text", 3000)
+    Busy := true
+    try {
+        StopRecClock()
+        SetIndicator("… process", "E0B050")
+        if !ClaudeWindowAlive() {
+            LogEvent("stop failed: Claude Code window is gone")
+            SetIndicator("No Claude", "E05050", 3000)
+            return
+        }
+        ; Only stop the recording if it is still running. If Claude Code already
+        ; stopped by itself, a Space on an empty prompt would start a new recording.
+        if MicInUse()
+            SendToClaude("{Space}")
+        else
+            LogEvent("mic already off, Space not sent")
+        DeliverText(WaitForTextOrEnter(6000, 6000), "No text", 3000)
+    } finally
+        Busy := false
 }
 
 ; The microphone went off on its own and no file has arrived yet.
 ClaudeStoppedItself() {
-    global Recording
+    global Recording, Busy
     Recording := false
-    LogEvent("mic went off by itself")
-    SetIndicator("… process", "E0B050")
-    DeliverText(WaitForText(2500), "No speech", 2000)
+    Busy := true
+    try {
+        LogEvent("mic went off by itself")
+        SetIndicator("… process", "E0B050")
+        DeliverText(WaitForTextOrEnter(2500, 3000), "No speech", 2000)
+    } finally
+        Busy := false
 }
 
 ; Claude Code ended the recording and submitted without our second Space.
 ClaudeSubmittedItself() {
-    global Recording
+    global Recording, Busy
     Recording := false
-    LogEvent("Claude Code submitted by itself")
-    SetIndicator("… process", "E0B050")
-    DeliverText(WaitForText(2000), "No text", 3000)
+    Busy := true
+    try {
+        LogEvent("Claude Code submitted by itself")
+        SetIndicator("… process", "E0B050")
+        DeliverText(WaitForText(2000), "No text", 3000)
+    } finally
+        Busy := false
+}
+
+; Claude Code auto-submits transcripts of 3+ words. Shorter ones stay in the
+; input, so if nothing arrives we press Enter once and wait again (on an empty
+; input Enter does nothing).
+WaitForTextOrEnter(firstMs, secondMs) {
+    text := WaitForText(firstMs)
+    if (text = "") {
+        LogEvent("no text after " firstMs // 1000 " s, sending Enter")
+        SendToClaude("{Enter}")
+        text := WaitForText(secondMs)
+    }
+    return text
 }
 
 ; Pastes the text if there is any, otherwise shows the given error state.
@@ -607,6 +696,75 @@ DeliverText(text, errorLabel, errorMs) {
     PasteText(text)
     LogEvent("pasted " StrLen(text) " chars into " TargetHwnd " (" TargetTitle() ")")
     SetIndicator("✓ pasted", "60C060", 1500)
+    ClearClaudeInput()
+}
+
+; Claude Code puts a prompt blocked by the hook back into its input (seen on
+; 2.1.310), so it is erased after pasting: otherwise the next dictation is
+; appended to it, and a Space on a non-empty input types a space instead of
+; starting a recording.
+; Claude Code puts the text back once the hook has exited, which is after the
+; hook file appeared (the hook runs as bash -> bash -> powershell), so first
+; wait until no process with hook-grab.ps1 in its command line is left.
+; Erased with Ctrl+U (delete to line start; on an empty input it does nothing),
+; written straight into the console's input buffer: posted with ControlSend to
+; a console without the focus, the Ctrl is lost and a plain "u" arrives, and
+; Backspaces are too slow (the console takes about 150 keys a second, so a
+; long dictation would take seconds to erase).
+ClearClaudeInput() {
+    ; A Ctrl+Space pressed meanwhile waits until the input is erased.
+    Critical
+    hookDone := false
+    Loop 30 {
+        if !HookRunning() {
+            hookDone := true
+            break
+        }
+        Sleep 100
+    }
+    if !hookDone
+        LogEvent("hook still running after 3 s, erasing anyway; the next start erases again")
+    Sleep 200          ; the text comes back right after the hook exits
+    if !WriteCtrlU()
+        LogEvent("could not erase Claude Code's input (WriteConsoleInput failed)")
+}
+
+; Ctrl+U as a key-down and key-up record in the input buffer of the Claude Code
+; console. The script has no console of its own, so it attaches to that one
+; for the call and detaches again.
+WriteCtrlU() {
+    if !ClaudePid || !DllCall("AttachConsole", "uint", ClaudePid)
+        return false
+    input := DllCall("CreateFileW", "str", "CONIN$", "uint", 0xC0000000, "uint", 3, "ptr", 0, "uint", 3, "uint", 0, "ptr", 0, "ptr")
+    if (input = -1) {   ; INVALID_HANDLE_VALUE
+        DllCall("FreeConsole")
+        return false
+    }
+    ; Two INPUT_RECORDs of 20 bytes: EventType KEY_EVENT, then KEY_EVENT_RECORD.
+    records := Buffer(40, 0)
+    for index, keyDown in [1, 0] {
+        offset := (index - 1) * 20
+        NumPut("ushort", 1, records, offset)              ; EventType = KEY_EVENT
+        NumPut("int", keyDown, records, offset + 4)       ; bKeyDown
+        NumPut("ushort", 1, records, offset + 8)          ; wRepeatCount
+        NumPut("ushort", 0x55, records, offset + 10)      ; wVirtualKeyCode = U
+        NumPut("ushort", 0x16, records, offset + 12)      ; wVirtualScanCode of U
+        NumPut("ushort", 0x15, records, offset + 14)      ; UnicodeChar: Ctrl+U
+        NumPut("uint", 0x08, records, offset + 16)        ; dwControlKeyState = LEFT_CTRL_PRESSED
+    }
+    written := 0
+    ok := DllCall("WriteConsoleInputW", "ptr", input, "ptr", records, "uint", 2, "uint*", &written)
+    DllCall("CloseHandle", "ptr", input)
+    DllCall("FreeConsole")
+    return ok && written = 2
+}
+
+; Matches the hook command from dictate-settings.json, not just the file name,
+; so an editor with hook-grab.ps1 open does not count as a running hook.
+HookRunning() {
+    for process in ComObjGet("winmgmts:").ExecQuery("SELECT ProcessId FROM Win32_Process WHERE CommandLine LIKE '%-File hook-grab.ps1%'")
+        return true
+    return false
 }
 
 ; Escape inside Claude Code aborts the recording: nothing is submitted,
@@ -637,14 +795,16 @@ WaitForText(timeoutMs) {
 PasteText(text) {
     global TargetHwnd
     saved := ClipboardAll()
-    A_Clipboard := text
-    if !ClipWait(1)
-        return
-    if (TargetHwnd && WinExist("ahk_id " TargetHwnd)) {
-        WinActivate "ahk_id " TargetHwnd
-        WinWaitActive("ahk_id " TargetHwnd, , 2)
-    }
-    Send "^v"
-    Sleep 500
-    A_Clipboard := saved       ; restore whatever the user had in the clipboard
+    try {
+        A_Clipboard := text
+        if !ClipWait(1)
+            return
+        if (TargetHwnd && WinExist("ahk_id " TargetHwnd)) {
+            try WinActivate "ahk_id " TargetHwnd   ; the window may close in between
+            WinWaitActive("ahk_id " TargetHwnd, , 2)
+        }
+        Send "^v"
+        Sleep 500
+    } finally
+        A_Clipboard := saved   ; restore whatever the user had in the clipboard, on every path
 }

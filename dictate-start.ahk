@@ -51,8 +51,8 @@ if FirstRun {
 
 ; Explicit argument from the tray menu.
 if (A_Args.Length >= 1) {
-    if (A_Args[1] != "default")
-        IniWrite A_Args[1], Ini, "profiles", "last"
+    ; "default" is remembered as an empty last, so the next start keeps it too.
+    IniWrite (A_Args[1] != "default" ? A_Args[1] : ""), Ini, "profiles", "last"
     StartCore(A_Args[1])
 }
 
