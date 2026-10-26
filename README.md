@@ -123,10 +123,13 @@ On every start the launcher takes the first that applies:
    too, so a skill typed into that console does not run; run `/login` and other commands
    in an ordinary Claude Code window with the same profile.
 4. The script waits for the file, pastes the text via the clipboard and restores the old clipboard.
-   Claude Code puts a blocked prompt back into its input, so the script erases it with
-   Ctrl+U written straight into the console's input buffer (`WriteConsoleInput`); posted
-   with `ControlSend` to a console without the focus, Ctrl+U arrives as a plain "u".
-   The input is erased the same way before every recording starts.
+   Claude Code puts a blocked prompt back into its input some time later, and a Space on a
+   non-empty input types a space instead of starting a recording. So the text stays there
+   until the next start: then the script reads the input line from the console screen
+   (`ReadConsoleOutputCharacter`) and, if there is text, erases it with Ctrl+U written
+   straight into the console's input buffer (`WriteConsoleInput`; posted with `ControlSend`
+   to a console without the focus, Ctrl+U arrives as a plain "u") and waits until the
+   screen shows the input empty.
 5. The real microphone state is asked from the Windows audio system (Core Audio): while
    Claude Code records, its process has an active audio session on the microphone.
    Otherwise an empty recording cannot be told apart from a running one.

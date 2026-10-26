@@ -362,10 +362,20 @@ StopRecClock() {
 MicInUse() {
     if !ClaudePid
         return false
+    for session in AudioCaptureSessions()
+        if (session.pid = ClaudePid && session.state = 1)
+            return true
+    return false
+}
+
+; Audio sessions on all active microphones, of every program: {pid, state},
+; state 0 inactive, 1 active (recording), 2 expired.
+AudioCaptureSessions() {
+    list := []
     ; Every interface pointer goes into a ComValue(13, 0) wrapper, which releases
     ; it when the wrapper is freed, also when a call fails halfway. A microphone
     ; that fails (unplugged during the loop) is skipped and the others are still
-    ; checked, so one bad device does not read as "Claude Code stopped recording".
+    ; listed, so one bad device does not read as "Claude Code stopped recording".
     try {
         ; IMMDeviceEnumerator::EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE)
         deviceEnumerator := ComObject("{BCDE0395-E52F-467C-8E3D-C4579291692E}", "{A95664D2-9614-4F35-A746-DE8DB63617E6}")
@@ -390,13 +400,12 @@ MicInUse() {
                     ComCall(3, control, "int*", &state := 0)                                ; GetState
                     control2 := ComObjQuery(control, "{bfb7ff88-7239-4fc9-8fa2-07c950be9c6d}")   ; IAudioSessionControl2
                     ComCall(14, control2, "uint*", &sessionPid := 0)                        ; GetProcessId
-                    if (sessionPid = ClaudePid && state = 1)
-                        return true
+                    list.Push({pid: sessionPid, state: state})
                 }
             }
         }
     }
-    return false
+    return list
 }
 
 ; Full path of the executable behind the running Claude Code process, as the
@@ -452,6 +461,8 @@ RecTick() {
     if !Recording
         return
     if micOn {
+        if !MicSeen
+            LogEvent("mic came on, " elapsed " s after the start")
         MicSeen := true
     } else if MicSeen {
         ; The microphone went off without a file: either Claude Code is still
@@ -462,6 +473,10 @@ RecTick() {
     } else if (elapsed >= 5) {
         StopRecClock()
         global Recording := false
+        ; Before the Escape: what Claude Code shows and who holds the microphone,
+        ; to tell "the Space did not start a recording" from "the recording was
+        ; not seen".
+        LogMicDiagnostics()
         ; Cancel a start that is merely slow, so the microphone does not come on
         ; later with nobody waiting for the text.
         SendToClaude("{Escape}")
@@ -599,10 +614,7 @@ ToggleDictation() {
             SetIndicator("No Claude", "E05050", 3000)
             return
         }
-        ; Anything left in Claude Code's input (a prompt it put back after a
-        ; failed paste, keys typed into the visible console) would turn the
-        ; Space into a typed space instead of the start of a recording.
-        WriteCtrlU()
+        EmptyClaudeInput()
         SendToClaude("{Space}")
         Recording := true
         StartRecClock()
@@ -618,9 +630,36 @@ TargetTitle() {
     return ""
 }
 
+; Before the Space that starts a recording. Anything left in Claude Code's
+; input would turn the Space into a typed space instead of the start of a
+; recording: the prompt blocked by the hook, which Claude Code puts back into
+; its input some time after the paste (seen on 2.1.310), or keys typed into
+; the visible console. Erased only here, not right after the paste: there is
+; no telling when the prompt comes back, and it does no harm until the next start.
+; Erases only when the window shows text there, and then waits until it shows
+; the input empty: an erase sent right before the Space can reach Claude Code
+; together with it, and the Space is typed again. Several attempts, as the
+; text may still come back meanwhile. If the window cannot be read, the input
+; counts as empty: then the erase could not be written either.
+EmptyClaudeInput() {
+    text := ClaudeInputText()
+    if (text = "")
+        return
+    LogEvent("Claude Code input not empty before the start: " text)
+    Loop 3 {
+        WriteCtrlU()
+        Loop 10 {
+            Sleep 50
+            if (ClaudeInputText() = "")
+                return
+        }
+    }
+    LogEvent("could not empty Claude Code's input, starting anyway")
+}
+
 ; Second press (or the countdown reaching zero): stop, wait for the hook, paste.
-; Every way a recording ends sets Busy until the text is pasted and Claude Code's
-; input erased: a Ctrl+Space pressed meanwhile is ignored instead of starting a
+; Every way a recording ends sets Busy until the text is pasted: a Ctrl+Space
+; pressed meanwhile is ignored instead of starting a
 ; new recording on top (it would take over TargetHwnd and delete the hook file).
 ; The countdown and the self-stop paths run from the RecTick timer, which a
 ; hotkey can interrupt, so the per-hotkey thread limit does not cover them.
@@ -696,42 +735,14 @@ DeliverText(text, errorLabel, errorMs) {
     PasteText(text)
     LogEvent("pasted " StrLen(text) " chars into " TargetHwnd " (" TargetTitle() ")")
     SetIndicator("✓ pasted", "60C060", 1500)
-    ClearClaudeInput()
 }
 
-; Claude Code puts a prompt blocked by the hook back into its input (seen on
-; 2.1.310), so it is erased after pasting: otherwise the next dictation is
-; appended to it, and a Space on a non-empty input types a space instead of
-; starting a recording.
-; Claude Code puts the text back once the hook has exited, which is after the
-; hook file appeared (the hook runs as bash -> bash -> powershell), so first
-; wait until no process with hook-grab.ps1 in its command line is left.
-; Erased with Ctrl+U (delete to line start; on an empty input it does nothing),
-; written straight into the console's input buffer: posted with ControlSend to
-; a console without the focus, the Ctrl is lost and a plain "u" arrives, and
-; Backspaces are too slow (the console takes about 150 keys a second, so a
-; long dictation would take seconds to erase).
-ClearClaudeInput() {
-    ; A Ctrl+Space pressed meanwhile waits until the input is erased.
-    Critical
-    hookDone := false
-    Loop 30 {
-        if !HookRunning() {
-            hookDone := true
-            break
-        }
-        Sleep 100
-    }
-    if !hookDone
-        LogEvent("hook still running after 3 s, erasing anyway; the next start erases again")
-    Sleep 200          ; the text comes back right after the hook exits
-    if !WriteCtrlU()
-        LogEvent("could not erase Claude Code's input (WriteConsoleInput failed)")
-}
-
-; Ctrl+U as a key-down and key-up record in the input buffer of the Claude Code
-; console. The script has no console of its own, so it attaches to that one
-; for the call and detaches again.
+; Ctrl+U (delete to line start) as a key-down and key-up record in the input
+; buffer of the Claude Code console. Not posted with ControlSend: to a console
+; without the focus the Ctrl is lost and a plain "u" arrives. Not Backspaces:
+; the console takes about 150 keys a second, so a long dictation would take
+; seconds to erase. The script has no console of its own, so it attaches to
+; that one for the call and detaches again.
 WriteCtrlU() {
     if !ClaudePid || !DllCall("AttachConsole", "uint", ClaudePid)
         return false
@@ -759,12 +770,70 @@ WriteCtrlU() {
     return ok && written = 2
 }
 
-; Matches the hook command from dictate-settings.json, not just the file name,
-; so an editor with hook-grab.ps1 open does not count as a running hook.
-HookRunning() {
-    for process in ComObjGet("winmgmts:").ExecQuery("SELECT ProcessId FROM Win32_Process WHERE CommandLine LIKE '%-File hook-grab.ps1%'")
-        return true
-    return false
+; The last lineCount non-empty lines of the visible part of the Claude Code
+; console, attached the same way as WriteCtrlU. Empty if it cannot be read.
+ReadClaudeConsole(lineCount) {
+    ; A hotkey meanwhile would call WriteCtrlU, whose AttachConsole fails
+    ; while this script is still attached.
+    Critical
+    lines := []
+    if !ClaudePid || !DllCall("AttachConsole", "uint", ClaudePid)
+        return lines
+    output := DllCall("CreateFileW", "str", "CONOUT$", "uint", 0xC0000000, "uint", 3, "ptr", 0, "uint", 3, "uint", 0, "ptr", 0, "ptr")
+    if (output != -1) {   ; INVALID_HANDLE_VALUE
+        ; CONSOLE_SCREEN_BUFFER_INFO: buffer width at 0, visible window
+        ; (Left, Top, Right, Bottom) at 10.
+        info := Buffer(22, 0)
+        if DllCall("GetConsoleScreenBufferInfo", "ptr", output, "ptr", info) {
+            width := NumGet(info, 0, "short")
+            top := NumGet(info, 12, "short")
+            bottom := NumGet(info, 16, "short")
+            row := Buffer(width * 2)
+            y := bottom
+            while (y >= top && lines.Length < lineCount) {
+                read := 0
+                ; The COORD {X 0, Y y} goes by value as one 32-bit number.
+                DllCall("ReadConsoleOutputCharacterW", "ptr", output, "ptr", row, "uint", width, "uint", y << 16, "uint*", &read)
+                text := RTrim(StrGet(row, read, "UTF-16"))
+                if (text != "")
+                    lines.InsertAt(1, text)
+                y--
+            }
+        }
+        DllCall("CloseHandle", "ptr", output)
+    }
+    DllCall("FreeConsole")
+    return lines
+}
+
+; Text in Claude Code's input line: the lowest console line starting with ">",
+; without the ">". "" if the input is empty or the window cannot be read.
+ClaudeInputText() {
+    lines := ReadClaudeConsole(6)
+    Loop lines.Length {
+        line := lines[lines.Length - A_Index + 1]
+        if (SubStr(line, 1, 1) = ">")
+            return Trim(SubStr(line, 2), " `t" Chr(0xA0))   ; the prompt is followed by a no-break space
+    }
+    return ""
+}
+
+; The microphone did not come on: log every audio session on the microphones
+; (whose it is and its state, 1 = recording) and the bottom of the Claude Code
+; window, where its input line and voice status are.
+LogMicDiagnostics() {
+    sessions := ""
+    for session in AudioCaptureSessions() {
+        name := "?"
+        try name := ProcessGetName(session.pid)
+        sessions .= ", " name " pid " session.pid " state " session.state
+    }
+    LogEvent("microphone sessions (Claude Code pid " ClaudePid "): " (sessions != "" ? SubStr(sessions, 3) : "none"))
+    lines := ReadClaudeConsole(10)
+    if (lines.Length = 0)
+        LogEvent("Claude Code window could not be read")
+    for line in lines
+        LogEvent("console: " line)
 }
 
 ; Escape inside Claude Code aborts the recording: nothing is submitted,
