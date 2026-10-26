@@ -9,8 +9,8 @@ into any window. This utility closes that gap. Press Ctrl+Space in any applicati
 speak, press again, and the text is pasted where the cursor was.
 
 Under the hood Claude Code only acts as a "dictaphone": a hook intercepts the dictated
-text, the model never sees it, no tokens are spent. Transcription itself is free and
-does not count toward subscription limits.
+text, and the model never sees it. Transcription is free and does not count toward
+subscription limits; the only model call is a short session title, once per start, on Haiku.
 
 A small AutoHotkey utility, no build, no dependencies.
 
@@ -83,8 +83,8 @@ Recognition language: `dictate-settings.json`, key `language` (default `ru`; see
 | `dictate-start.ahk` | **run this one**: picks the profile and starts the core |
 | `dictate-core.ahk` | the core: hotkey, Claude Code window, indicator, pasting. Does not run on its own |
 | `dictate.ini` | settings; created from `dictate.example.ini`, not committed to git |
-| `dictate-settings.json` | Claude Code settings for the dictation instance: language, tap mode, hook |
-| `hook-grab.ps1` | the hook: intercepts the prompt, writes it to `dictate-out.txt`, blocks submission |
+| `dictate-settings.json` | Claude Code settings for the dictation instance: language, tap mode, model, hook |
+| `hook-grab.ps1` | the hook: intercepts the prompt, writes it to `dictate-out.txt`, stops Claude Code before the model |
 | `dictate.log` | log: hook lines with the recognized text and `[ahk]` lines from the script |
 
 ## How the profile is chosen
@@ -122,11 +122,10 @@ On every start the launcher takes the first that applies:
    `{"continue": false}`: Claude Code stops right there, the model never sees the prompt.
    Not exit code 2 (a blocked prompt): Claude Code puts a blocked prompt back into its input,
    where it would turn the next Space into a typed space. The prompt stays in that
-   instance's conversation instead, and after the first one Claude Code asks a small model
-   for a session title once per start; transcription itself does not count toward
-   your usage limits. Slash commands are captured
-   too, so a skill typed into that console does not run; run `/login` and other commands
-   in an ordinary Claude Code window with the same profile.
+   instance's conversation instead, and after the first one Claude Code asks the model
+   (Haiku, see point 8) for a session title once per start.
+   Slash commands are captured too, so a skill typed into that console does not run; run
+   `/login` and other commands in an ordinary Claude Code window with the same profile.
 4. The script waits for the file, pastes the text via the clipboard and restores the old clipboard.
    A Space on a non-empty input types a space instead of starting a recording, so before
    every start the script reads Claude Code's input box from the console screen
@@ -149,6 +148,10 @@ On every start the launcher takes the first that applies:
 8. It also sets the model to Haiku (`"model": "haiku"`): the dictation instance sends
    nothing to the model except the request for a session title, so the cheapest model
    is enough. Your other Claude Code windows keep their own model.
+9. Windows slows down background processes to save power, and the dictation console is
+   always in the background. The script turns this throttling off for Claude Code and its
+   console (`SetProcessInformation`, `ProcessPowerThrottling`), so that a long pause does
+   not slow down the start of a recording.
 
 ## Limitations
 
