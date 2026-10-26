@@ -1,7 +1,12 @@
 # UserPromptSubmit hook for the dictation instance of Claude Code.
 # Reads the submitted prompt from stdin JSON, writes the text as-is
-# to dictate-out.txt (UTF-8, no BOM) and exits with code 2,
-# so the prompt is blocked and never reaches the model.
+# to dictate-out.txt (UTF-8, no BOM) and answers {"continue": false},
+# so Claude Code stops right there and the prompt never reaches the model.
+# Not exit code 2 (a blocked prompt): Claude Code 2.1.310 puts a blocked
+# prompt back into its input, and the next Space would type a space there
+# instead of starting a recording; after "continue": false the input stays
+# empty. The prompt stays in the session's conversation instead, which is
+# never sent to the model.
 # The clipboard is NOT touched here; dictate-core.ahk handles pasting.
 
 [Console]::InputEncoding = [Text.Encoding]::UTF8
@@ -47,5 +52,5 @@ if (Test-Path -LiteralPath $outFile) { Remove-Item -LiteralPath $outFile -Force 
 Move-Item -LiteralPath $tmpFile -Destination $outFile -Force
 
 Write-Log ("captured {0} chars: {1}" -f $text.Length, $text)
-[Console]::Error.WriteLine(("[dictate] captured {0} chars" -f $text.Length))
-exit 2
+'{"continue": false, "stopReason": "[dictate] captured ' + $text.Length + ' chars"}'
+exit 0

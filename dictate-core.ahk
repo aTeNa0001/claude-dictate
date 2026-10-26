@@ -346,10 +346,33 @@ StartRecClock() {
     MicSeen := false
     RecTick()
     SetTimer RecTick, 1000
+    SetTimer WatchMicStart, 100
 }
 
 StopRecClock() {
     SetTimer RecTick, 0
+    SetTimer WatchMicStart, 0
+}
+
+; Until the microphone comes on, it is checked every 100 ms rather than only
+; by the once-a-second countdown, so the log shows how long the start took.
+WatchMicStart() {
+    if !Recording || MicSeen {
+        SetTimer WatchMicStart, 0
+        return
+    }
+    if MicInUse() && Recording
+        MarkMicOn()
+}
+
+; The first sight of the microphone in use during a recording, logged with
+; the time since the Space that started it.
+MarkMicOn() {
+    global MicSeen
+    if MicSeen
+        return
+    MicSeen := true
+    LogEvent("mic came on " (A_TickCount - RecStartTick) " ms after the Space")
 }
 
 ; Is Claude Code recording right now? Asked from the Windows audio system (Core
@@ -461,9 +484,7 @@ RecTick() {
     if !Recording
         return
     if micOn {
-        if !MicSeen
-            LogEvent("mic came on, " elapsed " s after the start")
-        MicSeen := true
+        MarkMicOn()
     } else if MicSeen {
         ; The microphone went off without a file: either Claude Code is still
         ; transcribing (file follows shortly) or it gave up ("No speech detected").
@@ -554,14 +575,34 @@ StartClaudeWindow() {
         return false
     }
 
+    throttlingOff := DisablePowerThrottling(ClaudePid) && DisablePowerThrottling(conhostPid)
     Sleep 5000   ; let Claude Code draw its prompt
     ApplyWindowMode(WindowMode)
-    WriteCtrlU()   ; erase what got typed into the console while it had the focus
+    EmptyClaudeInput()   ; erase what got typed into the console while it had the focus
     ClaudeStartPath := ClaudeImagePath()   ; "" if Claude Code crashed on startup
     ClaudeUpdated := false
     SetTimer CheckClaudeUpdate, 60000
-    LogEvent("Claude Code started, console hwnd " DictHwnd ", pid " ClaudePid " (" ClaudeStartPath "), config " (ConfigDir != "" ? ConfigDir : "default") ", window " WindowMode)
+    LogEvent("Claude Code started, console hwnd " DictHwnd ", pid " ClaudePid " (" ClaudeStartPath "), config " (ConfigDir != "" ? ConfigDir : "default") ", window " WindowMode ", power throttling " (throttlingOff ? "off" : "NOT turned off"))
     return true
+}
+
+; Windows slows down background processes to save power (power throttling,
+; the "efficiency mode" of Task Manager). Claude Code and its console are
+; always in the background, so after a long pause they could be slow to start
+; a recording. This opts one process out: ControlMask names the kinds of
+; throttling decided here (execution speed 1, timer resolution 4), StateMask 0
+; turns them off. True if Windows accepted it.
+DisablePowerThrottling(pid) {
+    h := DllCall("OpenProcess", "uint", 0x0200, "int", 0, "uint", pid, "ptr")   ; PROCESS_SET_INFORMATION
+    if !h
+        return false
+    state := Buffer(12, 0)              ; PROCESS_POWER_THROTTLING_STATE
+    NumPut("uint", 1, state, 0)         ; Version
+    NumPut("uint", 1 | 4, state, 4)     ; ControlMask
+    NumPut("uint", 0, state, 8)         ; StateMask
+    ok := DllCall("SetProcessInformation", "ptr", h, "int", 4, "ptr", state, "uint", 12)   ; ProcessPowerThrottling
+    DllCall("CloseHandle", "ptr", h)
+    return ok != 0
 }
 
 ; Pid of the child process of parentPid with the given exe name, 0 if none (yet).
@@ -595,7 +636,7 @@ SendToClaude(keys) {
 
 ; Same file the hook writes to; script lines are tagged [ahk].
 LogEvent(msg) {
-    try FileAppend FormatTime(A_Now, "yyyy-MM-dd HH:mm:ss") " [ahk] " msg "`n", LogFile, "UTF-8"
+    try FileAppend FormatTime(A_Now, "yyyy-MM-dd HH:mm:ss") "." A_MSec " [ahk] " msg "`n", LogFile, "UTF-8"
 }
 
 ; ---- dictation ----------------------------------------------------
@@ -605,6 +646,10 @@ ToggleDictation() {
     if Busy
         return      ; the previous recording is still being collected and pasted
     if !Recording {
+        pressTick := A_TickCount
+        ; Time since the last keyboard or mouse event, normally the hotkey
+        ; itself: shows whether Windows delivered the hotkey late.
+        sinceKey := A_TimeIdle
         try TargetHwnd := WinGetID("A")
         catch
             TargetHwnd := 0
@@ -616,9 +661,10 @@ ToggleDictation() {
         }
         EmptyClaudeInput()
         SendToClaude("{Space}")
+        spaceMs := A_TickCount - pressTick
         Recording := true
         StartRecClock()
-        LogEvent("recording started, target window " TargetHwnd " (" TargetTitle() ")")
+        LogEvent("recording started, target window " TargetHwnd " (" TargetTitle() "); hotkey seen " sinceKey " ms after the last key event, Space sent after " spaceMs " ms, REC shown after " (A_TickCount - pressTick) " ms")
     } else {
         LogEvent("stop requested by hotkey")
         FinishDictation()
@@ -630,28 +676,36 @@ TargetTitle() {
     return ""
 }
 
-; Before the Space that starts a recording. Anything left in Claude Code's
-; input would turn the Space into a typed space instead of the start of a
-; recording: the prompt blocked by the hook, which Claude Code puts back into
-; its input some time after the paste (seen on 2.1.310), or keys typed into
-; the visible console. Erased only here, not right after the paste: there is
-; no telling when the prompt comes back, and it does no harm until the next start.
-; Erases only when the window shows text there, and then waits until it shows
-; the input empty: an erase sent right before the Space can reach Claude Code
-; together with it, and the Space is typed again. Several attempts, as the
-; text may still come back meanwhile. If the window cannot be read, the input
-; counts as empty: then the erase could not be written either.
+; Before the Space that starts a recording (and once after Claude Code starts).
+; Anything left in Claude Code's input would turn the Space into a typed space
+; instead of the start of a recording. Normally the input is empty: the hook
+; stops a prompt with "continue": false, and then Claude Code leaves the input
+; empty. Text is left there only when the hook failed to run (Claude Code puts
+; a blocked prompt back into its input, seen on 2.1.310) or keys were typed
+; into the visible console.
+; So the window is read first, and only text found there is erased, with a
+; line in the log; then it waits until the window shows the input empty: an
+; erase sent right before the Space can reach Claude Code together with it,
+; and the Space is typed again. Several attempts, as the text may still come
+; back meanwhile. If the window cannot be read, the input counts as empty:
+; then the erase could not be written either.
+; Ctrl+U erases one screen line of the input, so the erase is one Ctrl+U per
+; line the text takes, plus two in case it grew meanwhile; the extra ones hit
+; an empty input and do nothing.
 EmptyClaudeInput() {
-    text := ClaudeInputText()
+    text := ClaudeInputText(&lineCount)
     if (text = "")
         return
-    LogEvent("Claude Code input not empty before the start: " text)
+    startTick := A_TickCount
+    LogEvent("Claude Code input not empty (" lineCount " lines), sending Ctrl+U: " SubStr(text, 1, 100))
     Loop 3 {
-        WriteCtrlU()
+        WriteCtrlU(lineCount + 2)
         Loop 10 {
             Sleep 50
-            if (ClaudeInputText() = "")
+            if (ClaudeInputText(&lineCount) = "") {
+                LogEvent("Claude Code input empty after " (A_TickCount - startTick) " ms")
                 return
+            }
         }
     }
     LogEvent("could not empty Claude Code's input, starting anyway")
@@ -742,8 +796,8 @@ DeliverText(text, errorLabel, errorMs) {
 ; without the focus the Ctrl is lost and a plain "u" arrives. Not Backspaces:
 ; the console takes about 150 keys a second, so a long dictation would take
 ; seconds to erase. The script has no console of its own, so it attaches to
-; that one for the call and detaches again.
-WriteCtrlU() {
+; that one for the call and detaches again. count presses go in one write.
+WriteCtrlU(count := 1) {
     if !ClaudePid || !DllCall("AttachConsole", "uint", ClaudePid)
         return false
     input := DllCall("CreateFileW", "str", "CONIN$", "uint", 0xC0000000, "uint", 3, "ptr", 0, "uint", 3, "uint", 0, "ptr", 0, "ptr")
@@ -751,10 +805,11 @@ WriteCtrlU() {
         DllCall("FreeConsole")
         return false
     }
-    ; Two INPUT_RECORDs of 20 bytes: EventType KEY_EVENT, then KEY_EVENT_RECORD.
-    records := Buffer(40, 0)
-    for index, keyDown in [1, 0] {
-        offset := (index - 1) * 20
+    ; Per press two INPUT_RECORDs of 20 bytes: EventType KEY_EVENT, then KEY_EVENT_RECORD.
+    records := Buffer(40 * count, 0)
+    Loop count * 2 {
+        keyDown := Mod(A_Index, 2)          ; down, up, down, up, ...
+        offset := (A_Index - 1) * 20
         NumPut("ushort", 1, records, offset)              ; EventType = KEY_EVENT
         NumPut("int", keyDown, records, offset + 4)       ; bKeyDown
         NumPut("ushort", 1, records, offset + 8)          ; wRepeatCount
@@ -764,10 +819,10 @@ WriteCtrlU() {
         NumPut("uint", 0x08, records, offset + 16)        ; dwControlKeyState = LEFT_CTRL_PRESSED
     }
     written := 0
-    ok := DllCall("WriteConsoleInputW", "ptr", input, "ptr", records, "uint", 2, "uint*", &written)
+    ok := DllCall("WriteConsoleInputW", "ptr", input, "ptr", records, "uint", count * 2, "uint*", &written)
     DllCall("CloseHandle", "ptr", input)
     DllCall("FreeConsole")
-    return ok && written = 2
+    return ok && written = count * 2
 }
 
 ; The last lineCount non-empty lines of the visible part of the Claude Code
@@ -806,16 +861,42 @@ ReadClaudeConsole(lineCount) {
     return lines
 }
 
-; Text in Claude Code's input line: the lowest console line starting with ">",
-; without the ">". "" if the input is empty or the window cannot be read.
-ClaudeInputText() {
-    lines := ReadClaudeConsole(6)
+; Text in Claude Code's input box: the lines between its lower and upper
+; border (lines of "─"), without the ">" prompt. A long text wraps over many
+; lines, so the box is found from its lower border up, not by the ">" line,
+; which can be far above the bottom. The prompt is drawn as ">" or "❯".
+; An empty input shows a grey hint like Try "how do I log an error?", which
+; counts as empty. "" if the input is empty or the window cannot be read.
+; lineCount gets the number of screen lines the text takes.
+ClaudeInputText(&lineCount := 0) {
+    lines := ReadClaudeConsole(40)
+    text := ""
+    lineCount := 0
+    insideBox := false
     Loop lines.Length {
         line := lines[lines.Length - A_Index + 1]
-        if (SubStr(line, 1, 1) = ">")
-            return Trim(SubStr(line, 2), " `t" Chr(0xA0))   ; the prompt is followed by a no-break space
+        if (SubStr(line, 1, 1) = "─") {
+            if insideBox
+                break           ; upper border
+            insideBox := true   ; lower border; the status lines under it are skipped
+            continue
+        }
+        if !insideBox
+            continue
+        isPromptLine := (SubStr(line, 1, 1) = ">" || SubStr(line, 1, 1) = "❯")
+        if isPromptLine
+            line := SubStr(line, 2)
+        text := Trim(line, " `t" Chr(0xA0)) " " text   ; the prompt is followed by a no-break space
+        lineCount++
+        if isPromptLine
+            break
     }
-    return ""
+    text := Trim(text)
+    if (text = "" || RegExMatch(text, '^Try "[^"]*"$')) {
+        lineCount := 0
+        return ""
+    }
+    return text
 }
 
 ; The microphone did not come on: log every audio session on the microphones

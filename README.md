@@ -118,18 +118,24 @@ On every start the launcher takes the first that applies:
    The file is passed only to this instance; global Claude Code settings are untouched.
    If the hook fails to run, the prompt is blocked anyway (`"onFailure": "block"`), and
    `"disableAllHooks": false` keeps a profile from switching the hook off.
-3. `hook-grab.ps1` receives the submitted prompt, writes it to `dictate-out.txt` and exits
-   with code 2: the prompt is blocked, the model never sees it. Slash commands are captured
+3. `hook-grab.ps1` receives the submitted prompt, writes it to `dictate-out.txt` and answers
+   `{"continue": false}`: Claude Code stops right there, the model never sees the prompt.
+   Not exit code 2 (a blocked prompt): Claude Code puts a blocked prompt back into its input,
+   where it would turn the next Space into a typed space. The prompt stays in that
+   instance's conversation instead, and after the first one Claude Code asks a small model
+   for a session title once per start; transcription itself does not count toward
+   your usage limits. Slash commands are captured
    too, so a skill typed into that console does not run; run `/login` and other commands
    in an ordinary Claude Code window with the same profile.
 4. The script waits for the file, pastes the text via the clipboard and restores the old clipboard.
-   Claude Code puts a blocked prompt back into its input some time later, and a Space on a
-   non-empty input types a space instead of starting a recording. So the text stays there
-   until the next start: then the script reads the input line from the console screen
-   (`ReadConsoleOutputCharacter`) and, if there is text, erases it with Ctrl+U written
-   straight into the console's input buffer (`WriteConsoleInput`; posted with `ControlSend`
-   to a console without the focus, Ctrl+U arrives as a plain "u") and waits until the
-   screen shows the input empty.
+   A Space on a non-empty input types a space instead of starting a recording, so before
+   every start the script reads Claude Code's input box from the console screen
+   (`ReadConsoleOutputCharacter`). Normally it is empty. Text is left there only when the
+   hook failed (the prompt is then blocked and put back) or keys were typed into the visible
+   console; then the script erases it with Ctrl+U written straight into the console's
+   input buffer (`WriteConsoleInput`; posted with `ControlSend` to a console without the
+   focus, Ctrl+U arrives as a plain "u"), one per screen line, logs it, and waits until
+   the screen shows the input empty.
 5. The real microphone state is asked from the Windows audio system (Core Audio): while
    Claude Code records, its process has an active audio session on the microphone.
    Otherwise an empty recording cannot be told apart from a running one.
@@ -140,6 +146,9 @@ On every start the launcher takes the first that applies:
 7. `dictate-settings.json` pins the display mode (`"tui": "default"`), so the dictation
    instance looks the same in every profile and no startup offer to switch modes catches
    the keys.
+8. It also sets the model to Haiku (`"model": "haiku"`): the dictation instance sends
+   nothing to the model except the request for a session title, so the cheapest model
+   is enough. Your other Claude Code windows keep their own model.
 
 ## Limitations
 
