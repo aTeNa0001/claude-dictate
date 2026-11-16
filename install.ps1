@@ -1,6 +1,6 @@
 # claude-dictate one-command installer (Windows PowerShell 5.1 and PowerShell 7).
 #
-#   irm https://raw.githubusercontent.com/aTeNa0001/claude-dictate/main/install.ps1 | iex
+#   irm https://raw.githubusercontent.com/aTeNa0001/claude-dictate/master/install.ps1 | iex
 #
 # What it does:
 #   1. installs AutoHotkey v2 with winget if it is missing
@@ -16,7 +16,7 @@
 $ErrorActionPreference = 'Stop'
 
 $Repo   = 'aTeNa0001/claude-dictate'
-$Branch = 'main'
+$Branch = 'master'
 $Dir    = if ($env:CLAUDE_DICTATE_DIR) { $env:CLAUDE_DICTATE_DIR } else { Join-Path $env:USERPROFILE 'tools\claude-dictate' }
 
 function Say([string]$msg) { Write-Host "[claude-dictate] $msg" }

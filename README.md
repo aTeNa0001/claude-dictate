@@ -21,7 +21,7 @@ the recognition language defaults to Japanese (`"language": "ja"` in `dictate-se
 and there is a one-command installer. In PowerShell:
 
 ```powershell
-irm https://raw.githubusercontent.com/aTeNa0001/claude-dictate/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/aTeNa0001/claude-dictate/master/install.ps1 | iex
 ```
 
 It installs AutoHotkey v2 with winget if missing, clones this repository into
