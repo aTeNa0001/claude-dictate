@@ -14,6 +14,22 @@ subscription limits; the only model call is a short session title, once per star
 
 A small AutoHotkey utility, no build, no dependencies.
 
+## This fork
+
+A fork of [android6/claude-dictate](https://github.com/android6/claude-dictate) with two changes:
+the recognition language defaults to Japanese (`"language": "ja"` in `dictate-settings.json`),
+and there is a one-command installer. In PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/aTeNa0001/claude-dictate/main/install.ps1 | iex
+```
+
+It installs AutoHotkey v2 with winget if missing, clones this repository into
+`~\tools\claude-dictate` (set `$env:CLAUDE_DICTATE_DIR` first for another place), creates
+`dictate.ini` (with the path to `claude.exe` when Claude Code was installed through npm) and
+starts the script. Running it again updates an existing install. Claude Code itself must
+already be installed and signed in.
+
 ## Requirements
 
 - Windows 10/11.
@@ -73,7 +89,7 @@ e.g. `^Space`, `^!d`, `#v`), path to `claude.exe`, window mode, indicator positi
 opacity, countdown limits, profiles. On first run the file is created
 from `dictate.example.ini`. After editing, `Reload` from the menu.
 
-Recognition language: `dictate-settings.json`, key `language` (default `ru`; see the
+Recognition language: `dictate-settings.json`, key `language` (`ja` in this fork, `ru` upstream; see the
 [supported languages](https://code.claude.com/docs/en/voice-dictation)).
 
 ## Files
