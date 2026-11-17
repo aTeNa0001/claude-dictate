@@ -41,6 +41,13 @@ global RecForceStopAt    := Cfg("recForceStopAt", -15)
 global RepasteKey        := Cfg("repasteKey", "^+Space")    ; paste the last text again; "" = off
 global HistoryKey        := Cfg("historyKey", "^!Space")    ; pick an earlier text and paste it; "" = off
 global HistGui           := 0
+global KeepOn            := Cfg("keepListening", 1)         ; restart when Claude Code stops by itself
+global SegBuffer         := ""       ; text of the parts already ended by Claude Code
+global SegCount          := 0        ; how many times this recording was restarted
+global SegStartTick      := 0        ; A_TickCount of the Space that started the current part
+global SegHadText        := false    ; the current part has shown recognized text
+global Rearming          := false    ; a part ended, its text is collected and the next one started
+global StopRequested     := false    ; the hotkey was pressed meanwhile
 global PreviewOn         := Cfg("preview", 1)              ; live transcript next to the indicator
 global PreviewChars      := Cfg("previewChars", 60)         ; how much of its end is shown
 global SoundsOn          := Cfg("sounds", 1)                ; audio cues
@@ -420,12 +427,16 @@ HidePreview() {
 ; While recording: the input of Claude Code, without the cursor that Claude
 ; Code draws as a level bar (block characters) at its end.
 PreviewTick() {
-    if !Recording
+    global SegHadText
+    if !Recording || Rearming
         return
     text := RegExReplace(ClaudeInputText(), "[\x{2580}-\x{259F}\s]+$")
-    if !Recording       ; a hotkey ended the recording meanwhile
+    if !Recording || Rearming      ; a hotkey ended the recording meanwhile
         return
-    ShowPreview(text)
+    if (text != "")
+        SegHadText := true
+    if PreviewOn
+        ShowPreview(JoinSeg(SegBuffer, text))   ; with the parts before a restart
 }
 
 ; ---- microphone level ---------------------------------------------
@@ -519,6 +530,7 @@ PlayCue(name) {
         switch name {
             case "start": cues[name] := MakeWav([[880, 60], [1175, 80]])
             case "stop":  cues[name] := MakeWav([[784, 70]])
+            case "resume": cues[name] := MakeWav([[1175, 45]])   ; the microphone is back on after a restart
             case "auto":  cues[name] := MakeWav([[784, 90], [0, 40], [587, 90], [0, 40], [440, 140]])
             case "error": cues[name] := MakeWav([[196, 120], [0, 60], [196, 160]])
             case "saved": cues[name] := MakeWav([[587, 70], [880, 90]])
@@ -754,7 +766,13 @@ IndicatorIdle() {
 ; the recording is finished exactly as if Ctrl+Space had been pressed again.
 StartRecClock() {
     global RecStartTick, MicSeen, PeakMax, LastLoudTick, MeterRetryTick, MeterLogPending
+    global SegBuffer, SegCount, SegStartTick, SegHadText, StopRequested
     RecStartTick := A_TickCount
+    SegStartTick := A_TickCount
+    SegBuffer := ""
+    SegCount := 0
+    SegHadText := false
+    StopRequested := false
     MicSeen := false
     ResetLevelBar()
     PeakMax := 0
@@ -765,7 +783,7 @@ StartRecClock() {
     SetTimer RecTick, 1000
     SetTimer WatchMicStart, 100
     SetTimer LevelTick, 80
-    if PreviewOn
+    if PreviewOn || KeepOn      ; keepListening needs to know whether text was recognized
         SetTimer PreviewTick, 400
 }
 
@@ -802,8 +820,8 @@ MarkMicOn() {
         return
     MicSeen := true
     ShowRecState()
-    PlayCue("start")
-    LogEvent("mic came on " (A_TickCount - RecStartTick) " ms after the Space")
+    PlayCue(SegCount ? "resume" : "start")
+    LogEvent("mic came on " (A_TickCount - SegStartTick) " ms after the Space")
 }
 
 ; Is Claude Code recording right now? Asked from the Windows audio system (Core
@@ -902,28 +920,42 @@ RecTick() {
     global MicSeen
     ; A hotkey can interrupt this timer anywhere (in MicInUse above all) and
     ; finish or cancel the recording; then the rest of this tick is stale.
-    if !Recording
+    if !Recording || Rearming
         return
     ; Claude Code stopped and submitted on its own (15 s of silence or its
-    ; 2-minute cap): the hook has already written the file, so just paste it.
+    ; 2-minute cap): the hook has already written the file.
     if FileExist(OutFile) {
-        StopRecClock()
-        ClaudeSubmittedItself()
-        return
+        if !KeepOn {
+            StopRecClock()      ; just paste it
+            ClaudeSubmittedItself()
+            return
+        }
+        if (MicSeen && !MicInUse()) {
+            if Recording && !Rearming
+                SegmentEnded(true)
+            return
+        }
+        ; The microphone is on (or coming on) again: this is the text of the
+        ; part before, which came after the restart.
+        AddSegment(ReadOutFile())
     }
     elapsed := (A_TickCount - RecStartTick) // 1000
     micOn := MicInUse()
-    if !Recording
+    if !Recording || Rearming
         return
     if micOn {
         MarkMicOn()
     } else if MicSeen {
+        if KeepOn {
+            SegmentEnded(false)
+            return
+        }
         ; The microphone went off without a file: either Claude Code is still
         ; transcribing (file follows shortly) or it gave up ("No speech detected").
         StopRecClock()
         ClaudeStoppedItself()
         return
-    } else if (elapsed >= 5) {
+    } else if (A_TickCount - SegStartTick >= 5000) {
         StopRecClock()
         global Recording := false
         ; Before the Escape: what Claude Code shows and who holds the microphone,
@@ -934,18 +966,104 @@ RecTick() {
         ; later with nobody waiting for the text.
         SendToClaude("{Escape}")
         LogEvent("mic never came on within 5 s, Escape sent")
+        if (SegBuffer != "") {
+            DeliverText(TakeSegments(""), "No mic", 3000)   ; the parts before the failed restart
+            return
+        }
         SetIndicator("No mic", "E05050", 3000)
         PlayCue("error")
         return
     }
     left := RecLimitSec - elapsed
-    if (left <= RecForceStopAt) {
+    ; With keepListening the countdown is the script's own: a restarted part
+    ; would run past it, as Claude Code counts its two minutes from the restart.
+    if (left <= (KeepOn ? 0 : RecForceStopAt)) {
         StopRecClock()
         LogEvent("countdown reached " left " s, forcing stop")
         FinishDictation()
         return
     }
     ShowRecState()
+}
+
+; ---- keep listening -----------------------------------------------
+
+; Claude Code ends a recording by itself after 15 seconds of silence (and
+; after two minutes), and has no setting for it. With keepListening the
+; script takes the text of the part that ended, starts the next recording
+; right away and pastes all parts together at the end, so a pause to think
+; does not end the dictation. Between the parts the microphone is off for
+; about a second (the indicator says "wait", a short tone marks it back on).
+
+; Two parts joined: with a space between two Latin words, with nothing
+; otherwise (Japanese).
+JoinSeg(a, b) {
+    if (a = "" || b = "")
+        return a b
+    latin := "^[\x21-\x7E]$"
+    return a ((SubStr(a, -1) ~= latin && SubStr(b, 1, 1) ~= latin) ? " " : "") b
+}
+
+AddSegment(text) {
+    global SegBuffer
+    if (text = "")
+        return
+    SegBuffer := JoinSeg(SegBuffer, text)
+    LogEvent("part of " StrLen(text) " chars kept, " StrLen(SegBuffer) " chars so far")
+}
+
+; Everything collected plus the last text; the collection is emptied.
+TakeSegments(text) {
+    global SegBuffer
+    all := JoinSeg(SegBuffer, text)
+    SegBuffer := ""
+    return all
+}
+
+; Claude Code ended the part by itself. fileReady: the hook has written its
+; text already. Otherwise the text follows (it is being transcribed), stays in
+; the input (under three words: Enter submits it), or there is none (silence).
+; The hotkey pressed meanwhile is remembered and ends the dictation here.
+SegmentEnded(fileReady) {
+    global Rearming, Busy, Recording, MicSeen, SegStartTick, SegHadText, SegCount, StopRequested
+    Rearming := true
+    Busy := true
+    try {
+        ResetLevelBar()
+        SetIndicator("… wait", "E0B050")
+        if fileReady
+            text := ReadOutFile()
+        else {
+            text := WaitForText(SegHadText ? 2500 : 1500)
+            if (text = "" && Recording && ClaudeInputText() != "") {
+                SendToClaude("{Enter}")
+                text := WaitForText(3000)
+            }
+        }
+        if !Recording       ; cancelled meanwhile
+            return
+        AddSegment(text)
+        left := RecLimitSec - (A_TickCount - RecStartTick) // 1000
+        if (StopRequested || left <= 1) {
+            Recording := false
+            StopRecClock()
+            PlayCue("stop")
+            LogEvent(StopRequested ? "stop requested by hotkey between two parts" : "countdown reached zero between two parts")
+            DeliverText(TakeSegments(""), "No speech", 2000)
+            return
+        }
+        EmptyClaudeInput()
+        SendToClaude("{Space}")
+        SegCount += 1
+        SegStartTick := A_TickCount
+        MicSeen := false
+        SegHadText := false
+        SetTimer WatchMicStart, 100
+        LogEvent("Claude Code stopped by itself, recording restarted (" SegCount "), " StrLen(SegBuffer) " chars so far")
+    } finally {
+        Rearming := false
+        Busy := false
+    }
 }
 
 ; The indicator during a recording. Until the microphone is really on (0.2 to
@@ -1087,9 +1205,12 @@ LogEvent(msg) {
 ; ---- dictation ----------------------------------------------------
 
 ToggleDictation() {
-    global Recording, TargetHwnd
-    if Busy
+    global Recording, TargetHwnd, StopRequested
+    if Busy {
+        if Rearming
+            StopRequested := true   ; between two parts: SegmentEnded ends the dictation
         return      ; the previous recording is still being collected and pasted
+    }
     if !Recording {
         pressTick := A_TickCount
         ; Time since the last keyboard or mouse event, normally the hotkey
@@ -1181,11 +1302,18 @@ FinishDictation() {
         PlayCue("stop")
         ; Only stop the recording if it is still running. If Claude Code already
         ; stopped by itself, a Space on an empty prompt would start a new recording.
-        if MicInUse()
+        micOn := MicInUse()
+        if micOn
             SendToClaude("{Space}")
         else
             LogEvent("mic already off, Space not sent")
-        DeliverText(WaitForTextOrEnter(6000, 6000), "No text", 3000)
+        ; Parts are collected already and the last one has shown no text (the
+        ; stop came after a silence): do not hold them back for the full wait.
+        if (SegBuffer != "" && !SegHadText)
+            text := WaitForText(micOn ? 2500 : 1500)
+        else
+            text := WaitForTextOrEnter(6000, 6000)
+        DeliverText(TakeSegments(text), "No text", 3000)
     } finally
         Busy := false
 }
@@ -1383,8 +1511,9 @@ LogMicDiagnostics() {
 ; Escape inside Claude Code aborts the recording: nothing is submitted,
 ; the hook does not run. Verified by hand on 2.1.257.
 CancelDictation() {
-    global Recording
+    global Recording, SegBuffer
     Recording := false
+    SegBuffer := ""
     StopRecClock()
     SendToClaude("{Escape}")
     LogEvent("cancelled by Escape")

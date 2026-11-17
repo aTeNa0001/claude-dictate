@@ -28,10 +28,16 @@ A fork of [android6/claude-dictate](https://github.com/android6/claude-dictate).
 - Every text is kept before it is pasted. Ctrl+Shift+Space pastes the last one again into the
   active window; `dictate-history.txt` holds all of them. A text that arrives after the script
   stopped waiting (`No text`) is kept the same way, shown as `↩ saved`.
+- Keep listening: Claude Code ends a recording by itself after 15 seconds of silence and has
+  no setting for it. The script then restarts the recording at once and pastes all parts
+  together when you stop or when the countdown reaches zero, so a pause to think does not end
+  the dictation. At each restart the microphone is off for about a second (`… wait`, then a
+  short tone). With `recLimitSec` above 120 a dictation can also run past Claude Code's
+  two-minute limit, at the cost of that one-second gap every two minutes.
 - A one-command installer.
 
-All of it is switched in `dictate.ini` (`repasteKey`, `preview`, `previewChars`, `sounds`,
-`soundVolume`).
+All of it is switched in `dictate.ini` (`repasteKey`, `historyKey`, `preview`, `previewChars`,
+`sounds`, `soundVolume`, `keepListening`).
 
 To install, in PowerShell:
 
