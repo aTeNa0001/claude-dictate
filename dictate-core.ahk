@@ -38,6 +38,11 @@ global IndicatorBorder   := Cfg("indicatorBorder", 0x909090)
 global RecLimitSec       := Cfg("recLimitSec", 120)
 global RecWarnSec        := Cfg("recWarnSec", 10)
 global RecForceStopAt    := Cfg("recForceStopAt", -15)
+global RepasteKey        := Cfg("repasteKey", "^+Space")    ; paste the last text again; "" = off
+global PreviewOn         := Cfg("preview", 1)               ; live transcript next to the indicator
+global PreviewChars      := Cfg("previewChars", 60)         ; how much of its end is shown
+global SoundsOn          := Cfg("sounds", 1)                ; audio cues
+global SoundVolume       := Cfg("soundVolume", 25)          ; 0..100
 
 Cfg(key, default) {
     return IniRead(StateIni, "settings", key, default)
@@ -63,6 +68,23 @@ global TargetHwnd  := 0
 global Indicator   := 0        ; Gui of the status indicator
 global IndText     := 0        ; its text control
 global IndState    := {text: "○ ready", color: "A0A0A0"}   ; current state, survives rebuilds
+global IndBar      := 0        ; microphone level bar under the text
+global HistoryFile := A_ScriptDir "\dictate-history.txt"   ; every captured text, newest last
+global LastFile    := A_ScriptDir "\dictate-last.txt"      ; the last captured text, for the repaste key
+global LastText    := ""
+global Meter       := 0        ; peak meter of the microphone Claude Code records from
+global MeterRetryTick := 0
+global Level       := 0        ; smoothed bar value, 0..100
+global PeakMax     := 0        ; loudest peak of this recording, 0..1, for the log
+global LastLoudTick := 0       ; last time the microphone heard anything
+global BarQuiet    := false    ; the bar is in its "nothing heard" colour
+global MeterLogPending := false
+global Preview     := 0        ; Gui of the live transcript
+global PrevText    := 0        ; its text control
+global PreviewVisible := false
+global LateUntil   := 0        ; until when a text that missed its paste is still waited for
+
+try LastText := FileRead(LastFile, "UTF-8")
 
 if (ClaudeExe = "")
     ClaudeExe := FindClaudeExe()
@@ -115,6 +137,8 @@ IndicatorIdle()
 ; outside of that window it does not exist and reaches the app as usual.
 try {
     Hotkey HotkeyToggle, (*) => ToggleDictation()
+    if (RepasteKey != "")
+        Hotkey RepasteKey, (*) => RepasteLast()
     HotIf (*) => Recording
     Hotkey HotkeyCancel, (*) => CancelDictation()
     HotIf
@@ -137,6 +161,9 @@ CreateTrayMenu() {
     A_TrayMenu.Add("Claude window: visible",   (*) => ChooseWindowMode("visible"))
     A_TrayMenu.Add("Claude window: minimized", (*) => ChooseWindowMode("minimized"))
     A_TrayMenu.Add("Claude window: hidden",    (*) => ChooseWindowMode("hidden"))
+    A_TrayMenu.Add()
+    A_TrayMenu.Add("Copy last text", (*) => CopyLast())
+    A_TrayMenu.Add("Open history", (*) => OpenHistory())
     A_TrayMenu.Add()
     A_TrayMenu.Add("Autostart", (*) => ToggleAutostart())   ; shortcut in the Startup folder
     A_TrayMenu.Add()
@@ -251,7 +278,7 @@ ApplyWindowMode(mode) {
 ; ---- status indicator ---------------------------------------------
 
 CreateIndicator() {
-    global Indicator, IndText
+    global Indicator, IndText, IndBar, BarQuiet
     ; -Caption: no frame; +ToolWindow: no taskbar button.
     Indicator := Gui("+AlwaysOnTop -Caption +ToolWindow +Owner", "claude-dictate indicator")
     Indicator.BackColor := "1E1E1E"
@@ -259,6 +286,10 @@ CreateIndicator() {
     Indicator.MarginY := 5
     Indicator.SetFont("s10 bold", "Segoe UI")
     IndText := Indicator.AddText("w88 Center c" IndState.color, IndState.text)
+    ; Microphone level while recording. Disabled, so a click on it reaches the
+    ; window and drags it like a click anywhere else.
+    IndBar := Indicator.AddProgress("xm y+4 w88 h3 Disabled Background303030 c60C060 Range0-100", 0)
+    BarQuiet := false
     ; Lay it out hidden first to learn its real (DPI-scaled) size, then place it.
     Indicator.Show("Hide")
     WinGetPos , , &w, &h, Indicator
@@ -311,9 +342,275 @@ OnDisplayChange(*) {
 }
 
 RebuildIndicator() {
-    global Indicator
+    global Indicator, Preview, PreviewVisible
     try Indicator.Destroy()
+    if Preview {
+        try Preview.Destroy()
+        Preview := 0
+        PreviewVisible := false
+    }
     CreateIndicator()
+}
+
+; ---- live transcript ----------------------------------------------
+
+; Claude Code shows the words in its input while you speak. The end of that
+; text is shown in a small window above the indicator (below it when there is
+; no room), so a long recording can be seen to be going in. Clicks pass
+; through it (WS_EX_TRANSPARENT).
+ShowPreview(text) {
+    global Preview, PrevText, PreviewVisible
+    if (text = "") {
+        HidePreview()
+        return
+    }
+    tail := (StrLen(text) > PreviewChars) ? "…" SubStr(text, -PreviewChars) : text
+    if !Preview {
+        Preview := Gui("+AlwaysOnTop -Caption +ToolWindow +Owner +E0x20", "claude-dictate preview")
+        Preview.BackColor := "1E1E1E"
+        Preview.MarginX := 10
+        Preview.MarginY := 6
+        Preview.SetFont("s10", "Segoe UI")
+        PrevText := Preview.AddText("w340 r3 cD0D0D0")
+        Preview.Show("Hide")
+    }
+    if (PrevText.Text != tail)
+        PrevText.Text := tail
+    if !PreviewVisible {
+        WinGetPos &ix, &iy, &iw, &ih, Indicator
+        WinGetPos , , &pw, &ph, Preview
+        MonitorGetWorkArea(MonitorGetPrimary(), , &top)
+        x := Max(SysGet(76), ix + iw - pw)          ; right edges aligned; 76 = left of the virtual screen
+        y := (iy - ph - 6 >= top) ? iy - ph - 6 : iy + ih + 6
+        Preview.Show("NoActivate x" x " y" y)
+        WinSetTransparent 225, Preview
+        try DllCall("dwmapi\DwmSetWindowAttribute", "ptr", Preview.Hwnd, "uint", 33, "uint*", 2, "uint", 4)
+        try DllCall("dwmapi\DwmSetWindowAttribute", "ptr", Preview.Hwnd, "uint", 34, "uint*", IndicatorBorder, "uint", 4)
+        PreviewVisible := true
+    }
+}
+
+HidePreview() {
+    global PreviewVisible
+    if Preview && PreviewVisible
+        try Preview.Hide()
+    PreviewVisible := false
+}
+
+; While recording: the input of Claude Code, without the cursor that Claude
+; Code draws as a level bar (block characters) at its end.
+PreviewTick() {
+    if !Recording
+        return
+    text := RegExReplace(ClaudeInputText(), "[\x{2580}-\x{259F}\s]+$")
+    if !Recording       ; a hotkey ended the recording meanwhile
+        return
+    ShowPreview(text)
+}
+
+; ---- microphone level ---------------------------------------------
+
+; Peak meter (IAudioMeterInformation) of the microphone on which Claude Code
+; has its active audio session, 0 while it is not recording.
+ClaudeMeter() {
+    for session in AudioCaptureSessions() {
+        if (session.pid != ClaudePid || session.state != 1)
+            continue
+        try {
+            meterIid := Buffer(16)
+            DllCall("ole32\CLSIDFromString", "str", "{C02216F6-8C67-4B5B-9D00-D008E73E0064}", "ptr", meterIid)
+            meter := ComValue(13, 0)
+            ComCall(3, session.device, "ptr", meterIid, "uint", 23, "ptr", 0, "ptr*", meter)   ; IMMDevice::Activate
+            return meter
+        }
+    }
+    return 0
+}
+
+; Every 80 ms while recording: the bar follows the microphone. After four
+; seconds without any sound its track turns red: the microphone is on, but
+; nothing is heard (muted, wrong input device).
+LevelTick() {
+    global Meter, MeterRetryTick, Level, PeakMax, LastLoudTick
+    if !Recording
+        return
+    if !Meter {
+        if (A_TickCount < MeterRetryTick)
+            return
+        MeterRetryTick := A_TickCount + 400
+        Meter := ClaudeMeter()
+        if !Meter
+            return
+        LastLoudTick := A_TickCount
+    }
+    peak := 0.0
+    try
+        ComCall(3, Meter, "float*", &peak)    ; GetPeakValue, 0..1
+    catch {
+        Meter := 0
+        return
+    }
+    if (peak > PeakMax)
+        PeakMax := peak
+    if (peak > 0.02)
+        LastLoudTick := A_TickCount
+    ; The square root lifts quiet speech into the visible part of the bar;
+    ; the bar falls back slower than it rises.
+    Level := Max(Min(100, Round(100 * Sqrt(peak))), Round(Level * 0.8))
+    try IndBar.Value := Level
+    SetBarQuiet(A_TickCount - LastLoudTick > 4000)
+}
+
+SetBarQuiet(quiet) {
+    global BarQuiet
+    if (quiet = BarQuiet)
+        return
+    BarQuiet := quiet
+    try IndBar.Opt("Background" (quiet ? "B03030" : "303030"))
+}
+
+ResetLevelBar() {
+    global Meter, Level
+    Meter := 0
+    Level := 0
+    try IndBar.Value := 0
+    SetBarQuiet(false)
+}
+
+; ---- audio cues ---------------------------------------------------
+
+; Short tones, so the state is known without looking at the indicator:
+;   start  the microphone really came on
+;   stop   stopped by the hotkey
+;   auto   Claude Code stopped by itself (silence, two-minute limit)
+;   error  nothing was pasted
+;   saved  a text arrived too late to be pasted and was kept for the repaste key
+; Played from memory without waiting; the buffers are built once and kept,
+; as PlaySound reads them while the script goes on.
+PlayCue(name) {
+    static cues := Map()
+    if !SoundsOn
+        return
+    if !cues.Has(name) {
+        switch name {
+            case "start": cues[name] := MakeWav([[880, 60], [1175, 80]])
+            case "stop":  cues[name] := MakeWav([[784, 70]])
+            case "auto":  cues[name] := MakeWav([[784, 90], [0, 40], [587, 90], [0, 40], [440, 140]])
+            case "error": cues[name] := MakeWav([[196, 120], [0, 60], [196, 160]])
+            case "saved": cues[name] := MakeWav([[587, 70], [880, 90]])
+            default: return
+        }
+    }
+    DllCall("winmm\PlaySoundW", "ptr", cues[name], "ptr", 0, "uint", 0x4 | 0x1 | 0x2)   ; SND_MEMORY | SND_ASYNC | SND_NODEFAULT
+}
+
+; A WAV file in memory (16-bit mono PCM): notes is a list of [frequency in Hz,
+; length in ms], frequency 0 = pause. Each note fades in and out over 8 ms,
+; otherwise it clicks.
+MakeWav(notes) {
+    rate := 22050
+    total := 0
+    for note in notes
+        total += rate * note[2] // 1000
+    wav := Buffer(44 + total * 2, 0)
+    NumPut("uint", 0x46464952, "uint", 36 + total * 2, "uint", 0x45564157, wav, 0)   ; "RIFF", size, "WAVE"
+    NumPut("uint", 0x20746D66, "uint", 16, "ushort", 1, "ushort", 1, wav, 12)        ; "fmt ", PCM, mono
+    NumPut("uint", rate, "uint", rate * 2, "ushort", 2, "ushort", 16, wav, 24)       ; rates, block, bits
+    NumPut("uint", 0x61746164, "uint", total * 2, wav, 36)                           ; "data", size
+    amp := 32767 * 0.6 * Min(100, Max(0, SoundVolume)) / 100
+    fade := rate * 8 // 1000
+    pos := 44
+    for note in notes {
+        n := rate * note[2] // 1000
+        Loop n {
+            i := A_Index - 1
+            sample := 0
+            if note[1]
+                sample := Round(amp * Min(1, i / fade, (n - 1 - i) / fade) * Sin(6.283185307 * note[1] * i / rate))
+            NumPut("short", sample, wav, pos)
+            pos += 2
+        }
+    }
+    return wav
+}
+
+; ---- history and repaste ------------------------------------------
+
+; Every captured text is kept before it is pasted: the last one for the
+; repaste key (also after a restart), all of them in dictate-history.txt.
+; A paste can miss (the target window closed, the focus moved); the text is
+; then still here.
+RememberText(text) {
+    global LastText
+    LastText := text
+    try {
+        file := FileOpen(LastFile, "w", "UTF-8")
+        file.Write(text)
+        file.Close()
+    }
+    try {
+        if (FileExist(HistoryFile) && FileGetSize(HistoryFile) > 2 * 1024 * 1024)
+            FileMove HistoryFile, A_ScriptDir "\dictate-history.old.txt", true
+        FileAppend "--- " FormatTime(A_Now, "yyyy-MM-dd HH:mm:ss") " (" StrLen(text) " chars)`n" text "`n`n", HistoryFile, "UTF-8"
+    }
+}
+
+; The repaste key: the last text again, into the window that is active now.
+RepasteLast() {
+    if Recording || Busy
+        return
+    if (LastText = "") {
+        SetIndicator("No last", "E05050", 2000)
+        return
+    }
+    try hwnd := WinGetID("A")
+    catch
+        hwnd := 0
+    if PasteText(LastText, hwnd) {
+        LogEvent("repasted " StrLen(LastText) " chars")
+        SetIndicator("✓ pasted", "60C060", 1500)
+    } else
+        SetIndicator("No paste", "E05050", 2000)
+}
+
+CopyLast() {
+    if (LastText = "")
+        return
+    A_Clipboard := LastText
+    SetIndicator("✓ copied", "60C060", 1500)
+}
+
+OpenHistory() {
+    if FileExist(HistoryFile)
+        Run 'notepad.exe "' HistoryFile '"'
+}
+
+; A text can arrive after the script stopped waiting for it (slow network, a
+; long recording). It is not pasted any more, as the user has moved on, but
+; kept for the repaste key. True if there was one.
+CollectLateText(announce) {
+    if !FileExist(OutFile)
+        return false
+    text := ReadOutFile()
+    if (text = "")
+        return false
+    RememberText(text)
+    LogEvent("late text kept for the repaste key: " StrLen(text) " chars")
+    if announce {
+        SetIndicator("↩ saved", "E0B050", 5000)
+        PlayCue("saved")
+    }
+    return true
+}
+
+; After "No text" and the like: watch for the late text for a while.
+WatchLateText() {
+    if (Recording || Busy || A_TickCount > LateUntil) {
+        SetTimer WatchLateText, 0     ; the start of a recording collects it itself
+        return
+    }
+    if CollectLateText(true)
+        SetTimer WatchLateText, 0
 }
 
 ; Shows a state; with resetMs > 0 it falls back to idle after that delay.
@@ -341,17 +638,34 @@ IndicatorIdle() {
 ; second; the last RecWarnSec seconds are shown in the warning colour. At zero
 ; the recording is finished exactly as if Ctrl+Space had been pressed again.
 StartRecClock() {
-    global RecStartTick, MicSeen
+    global RecStartTick, MicSeen, PeakMax, LastLoudTick, MeterRetryTick, MeterLogPending
     RecStartTick := A_TickCount
     MicSeen := false
+    ResetLevelBar()
+    PeakMax := 0
+    LastLoudTick := A_TickCount
+    MeterRetryTick := 0
+    MeterLogPending := true
     RecTick()
     SetTimer RecTick, 1000
     SetTimer WatchMicStart, 100
+    SetTimer LevelTick, 80
+    if PreviewOn
+        SetTimer PreviewTick, 400
 }
 
 StopRecClock() {
+    global MeterLogPending
     SetTimer RecTick, 0
     SetTimer WatchMicStart, 0
+    SetTimer LevelTick, 0
+    SetTimer PreviewTick, 0
+    if MeterLogPending {
+        MeterLogPending := false
+        LogEvent("mic level: " (Meter ? "loudest peak " Round(PeakMax * 100) "%" : "no meter"))
+    }
+    ResetLevelBar()
+    HidePreview()
 }
 
 ; Until the microphone comes on, it is checked every 100 ms rather than only
@@ -372,6 +686,7 @@ MarkMicOn() {
     if MicSeen
         return
     MicSeen := true
+    PlayCue("start")
     LogEvent("mic came on " (A_TickCount - RecStartTick) " ms after the Space")
 }
 
@@ -391,8 +706,9 @@ MicInUse() {
     return false
 }
 
-; Audio sessions on all active microphones, of every program: {pid, state},
-; state 0 inactive, 1 active (recording), 2 expired.
+; Audio sessions on all active microphones, of every program: {pid, state, device},
+; state 0 inactive, 1 active (recording), 2 expired; device is the microphone
+; (IMMDevice) the session is on.
 AudioCaptureSessions() {
     list := []
     ; Every interface pointer goes into a ComValue(13, 0) wrapper, which releases
@@ -423,7 +739,7 @@ AudioCaptureSessions() {
                     ComCall(3, control, "int*", &state := 0)                                ; GetState
                     control2 := ComObjQuery(control, "{bfb7ff88-7239-4fc9-8fa2-07c950be9c6d}")   ; IAudioSessionControl2
                     ComCall(14, control2, "uint*", &sessionPid := 0)                        ; GetProcessId
-                    list.Push({pid: sessionPid, state: state})
+                    list.Push({pid: sessionPid, state: state, device: device})
                 }
             }
         }
@@ -503,6 +819,7 @@ RecTick() {
         SendToClaude("{Escape}")
         LogEvent("mic never came on within 5 s, Escape sent")
         SetIndicator("No mic", "E05050", 3000)
+        PlayCue("error")
         return
     }
     left := RecLimitSec - elapsed
@@ -653,10 +970,13 @@ ToggleDictation() {
         try TargetHwnd := WinGetID("A")
         catch
             TargetHwnd := 0
+        SetTimer WatchLateText, 0
+        CollectLateText(false)     ; a text that came too late is kept, not deleted
         try FileDelete OutFile
         if !ClaudeWindowAlive() && !StartClaudeWindow() {
             LogEvent("start failed: no Claude Code window")
             SetIndicator("No Claude", "E05050", 3000)
+            PlayCue("error")
             return
         }
         EmptyClaudeInput()
@@ -727,8 +1047,10 @@ FinishDictation() {
         if !ClaudeWindowAlive() {
             LogEvent("stop failed: Claude Code window is gone")
             SetIndicator("No Claude", "E05050", 3000)
+            PlayCue("error")
             return
         }
+        PlayCue("stop")
         ; Only stop the recording if it is still running. If Claude Code already
         ; stopped by itself, a Space on an empty prompt would start a new recording.
         if MicInUse()
@@ -748,6 +1070,7 @@ ClaudeStoppedItself() {
     try {
         LogEvent("mic went off by itself")
         SetIndicator("… process", "E0B050")
+        PlayCue("auto")
         DeliverText(WaitForTextOrEnter(2500, 3000), "No speech", 2000)
     } finally
         Busy := false
@@ -761,6 +1084,7 @@ ClaudeSubmittedItself() {
     try {
         LogEvent("Claude Code submitted by itself")
         SetIndicator("… process", "E0B050")
+        PlayCue("auto")
         DeliverText(WaitForText(2000), "No text", 3000)
     } finally
         Busy := false
@@ -781,12 +1105,23 @@ WaitForTextOrEnter(firstMs, secondMs) {
 
 ; Pastes the text if there is any, otherwise shows the given error state.
 DeliverText(text, errorLabel, errorMs) {
+    global LateUntil
     if (text = "") {
         LogEvent("nothing to paste: " errorLabel)
         SetIndicator(errorLabel, "E05050", errorMs)
+        PlayCue("error")
+        ; The text may still come (slow network): keep it then, see CollectLateText.
+        LateUntil := A_TickCount + 90000
+        SetTimer WatchLateText, 500
         return
     }
-    PasteText(text)
+    RememberText(text)      ; before the paste, which can miss
+    if !PasteText(text, TargetHwnd) {
+        LogEvent("paste failed (clipboard), " StrLen(text) " chars kept for the repaste key")
+        SetIndicator("No paste", "E05050", 3000)
+        PlayCue("error")
+        return
+    }
     LogEvent("pasted " StrLen(text) " chars into " TargetHwnd " (" TargetTitle() ")")
     SetIndicator("✓ pasted", "60C060", 1500)
 }
@@ -931,30 +1266,37 @@ CancelDictation() {
 WaitForText(timeoutMs) {
     start := A_TickCount
     while (A_TickCount - start < timeoutMs) {
-        if FileExist(OutFile) {
-            Sleep 50
-            text := FileRead(OutFile, "UTF-8")
-            try FileDelete OutFile
-            return Trim(text, " `t`r`n")
-        }
+        if FileExist(OutFile)
+            return ReadOutFile()
         Sleep 100
     }
     return ""
 }
 
-PasteText(text) {
-    global TargetHwnd
+; The text the hook wrote; the file is removed.
+ReadOutFile() {
+    Sleep 50
+    text := ""
+    try text := FileRead(OutFile, "UTF-8")
+    try FileDelete OutFile
+    return Trim(text, " `t`r`n")
+}
+
+; Pastes into the given window (the active one if it is gone). False if the
+; clipboard did not take the text.
+PasteText(text, hwnd) {
     saved := ClipboardAll()
     try {
         A_Clipboard := text
         if !ClipWait(1)
-            return
-        if (TargetHwnd && WinExist("ahk_id " TargetHwnd)) {
-            try WinActivate "ahk_id " TargetHwnd   ; the window may close in between
-            WinWaitActive("ahk_id " TargetHwnd, , 2)
+            return false
+        if (hwnd && WinExist("ahk_id " hwnd)) {
+            try WinActivate "ahk_id " hwnd   ; the window may close in between
+            WinWaitActive("ahk_id " hwnd, , 2)
         }
         Send "^v"
         Sleep 500
+        return true
     } finally
         A_Clipboard := saved   ; restore whatever the user had in the clipboard, on every path
 }

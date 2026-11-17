@@ -3,6 +3,9 @@ dictate.ini
 dictate.log
 dictate-out.txt
 dictate-out.tmp
+dictate-history.txt
+dictate-history.old.txt
+dictate-last.txt
 # working draft, not part of the project
 START-PROMPT.md
 # память ассистентов (общий протокол)

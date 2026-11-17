@@ -16,9 +16,24 @@ A small AutoHotkey utility, no build, no dependencies.
 
 ## This fork
 
-A fork of [android6/claude-dictate](https://github.com/android6/claude-dictate) with two changes:
-the recognition language defaults to Japanese (`"language": "ja"` in `dictate-settings.json`),
-and there is a one-command installer. In PowerShell:
+A fork of [android6/claude-dictate](https://github.com/android6/claude-dictate). What is different:
+
+- The recognition language defaults to Japanese (`"language": "ja"` in `dictate-settings.json`).
+- A microphone level bar under the indicator while recording. Its track turns red after
+  four seconds without any sound: the microphone is on, but nothing is heard.
+- A live transcript: the end of what Claude Code has recognized so far is shown next to the
+  indicator while you speak, so a long recording can be seen to be going in.
+- Audio cues: the microphone came on, stopped by the hotkey, stopped by Claude Code itself
+  (15 seconds of silence, the two-minute limit), nothing pasted.
+- Every text is kept before it is pasted. Ctrl+Shift+Space pastes the last one again into the
+  active window; `dictate-history.txt` holds all of them. A text that arrives after the script
+  stopped waiting (`No text`) is kept the same way, shown as `↩ saved`.
+- A one-command installer.
+
+All of it is switched in `dictate.ini` (`repasteKey`, `preview`, `previewChars`, `sounds`,
+`soundVolume`).
+
+To install, in PowerShell:
 
 ```powershell
 irm https://raw.githubusercontent.com/aTeNa0001/claude-dictate/master/install.ps1 | iex
@@ -61,6 +76,7 @@ closes together with the script.
 | Ctrl+Space | start recording |
 | Ctrl+Space again | stop and paste the text into the window you started in |
 | Escape while recording | cancel, paste nothing |
+| Ctrl+Shift+Space | paste the last dictated text again, into the active window |
 
 Outside of a recording the script does not touch Escape. The clipboard is restored after pasting.
 
@@ -80,6 +96,8 @@ console window mode (hidden, minimized, visible), `Autostart` (check mark = shor
 | `… process` | recording stopped, waiting for the text |
 | `✓ pasted` | pasted |
 | `✕ ESC` | cancelled |
+| `↩ saved` (yellow) | a text arrived too late to be pasted; it is kept, press Ctrl+Shift+Space |
+| `No paste` / `No last` | the clipboard did not take the text (it is kept) / nothing to paste again |
 | `No speech` / `No text` / `No mic` / `No Claude` | error, see `dictate.log` |
 
 ## Settings
@@ -102,6 +120,8 @@ Recognition language: `dictate-settings.json`, key `language` (`ja` in this fork
 | `dictate-settings.json` | Claude Code settings for the dictation instance: language, tap mode, model, hook |
 | `hook-grab.ps1` | the hook: intercepts the prompt, writes it to `dictate-out.txt`, stops Claude Code before the model |
 | `dictate.log` | log: hook lines with the recognized text and `[ahk]` lines from the script |
+| `dictate-history.txt` | every dictated text with its time; moved to `dictate-history.old.txt` at 2 MB. Not committed to git |
+| `dictate-last.txt` | the last dictated text, for Ctrl+Shift+Space after a restart. Not committed to git |
 
 ## How the profile is chosen
 
