@@ -92,6 +92,7 @@ console window mode (hidden, minimized, visible), `Autostart` (check mark = shor
 |---|---|
 | `○ ready` | ready |
 | `↻ updated` (yellow) | ready; Claude Code updated itself in the background, the old version keeps running until `Reload` |
+| `… wait` (yellow) | the hotkey was pressed, the microphone is not on yet (0.2 to 1 second): do not speak yet |
 | `● REC 1:53` | recording, countdown to two minutes, last 10 seconds in red |
 | `… process` | recording stopped, waiting for the text |
 | `✓ pasted` | pasted |

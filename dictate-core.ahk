@@ -452,11 +452,15 @@ LevelTick() {
     }
     if (peak > PeakMax)
         PeakMax := peak
-    if (peak > 0.02)
+    ; "Heard anything" is far below speech: a quiet microphone peaks at a few
+    ; percent while speaking, a muted one stays at zero.
+    if (peak > 0.004)
         LastLoudTick := A_TickCount
-    ; The square root lifts quiet speech into the visible part of the bar;
-    ; the bar falls back slower than it rises.
-    Level := Max(Min(100, Round(100 * Sqrt(peak))), Round(Level * 0.8))
+    ; In decibels, -50 dB .. 0 dB over the bar, as loudness is heard: speech
+    ; peaking at 5% (-26 dB) fills half of it. The bar falls back slower than
+    ; it rises.
+    target := (peak > 0) ? Max(0, Min(100, Round((20 * Log(peak) + 50) * 2))) : 0
+    Level := Max(target, Round(Level * 0.8))
     try IndBar.Value := Level
     SetBarQuiet(A_TickCount - LastLoudTick > 4000)
 }
@@ -686,6 +690,7 @@ MarkMicOn() {
     if MicSeen
         return
     MicSeen := true
+    ShowRecState()
     PlayCue("start")
     LogEvent("mic came on " (A_TickCount - RecStartTick) " ms after the Space")
 }
@@ -829,7 +834,19 @@ RecTick() {
         FinishDictation()
         return
     }
-    ; green while recording, red for the last RecWarnSec seconds and past zero
+    ShowRecState()
+}
+
+; The indicator during a recording. Until the microphone is really on (0.2 to
+; 1 second after the hotkey) it says "wait" in yellow: words spoken before
+; that are lost. Then the countdown, green, red for the last RecWarnSec
+; seconds and past zero.
+ShowRecState() {
+    if !MicSeen {
+        SetIndicator("… wait", "E0B050")
+        return
+    }
+    left := RecLimitSec - (A_TickCount - RecStartTick) // 1000
     a := Abs(left)
     SetIndicator("● REC " (left < 0 ? "-" : "") (a // 60) ":" Format("{:02}", Mod(a, 60)), (left <= RecWarnSec) ? "FF4040" : "60C060")
 }
