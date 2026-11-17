@@ -39,7 +39,9 @@ global RecLimitSec       := Cfg("recLimitSec", 120)
 global RecWarnSec        := Cfg("recWarnSec", 10)
 global RecForceStopAt    := Cfg("recForceStopAt", -15)
 global RepasteKey        := Cfg("repasteKey", "^+Space")    ; paste the last text again; "" = off
-global PreviewOn         := Cfg("preview", 1)               ; live transcript next to the indicator
+global HistoryKey        := Cfg("historyKey", "^!Space")    ; pick an earlier text and paste it; "" = off
+global HistGui           := 0
+global PreviewOn         := Cfg("preview", 1)              ; live transcript next to the indicator
 global PreviewChars      := Cfg("previewChars", 60)         ; how much of its end is shown
 global SoundsOn          := Cfg("sounds", 1)                ; audio cues
 global SoundVolume       := Cfg("soundVolume", 25)          ; 0..100
@@ -139,6 +141,8 @@ try {
     Hotkey HotkeyToggle, (*) => ToggleDictation()
     if (RepasteKey != "")
         Hotkey RepasteKey, (*) => RepasteLast()
+    if (HistoryKey != "")
+        Hotkey HistoryKey, (*) => ShowHistory(true)
     HotIf (*) => Recording
     Hotkey HotkeyCancel, (*) => CancelDictation()
     HotIf
@@ -163,7 +167,8 @@ CreateTrayMenu() {
     A_TrayMenu.Add("Claude window: hidden",    (*) => ChooseWindowMode("hidden"))
     A_TrayMenu.Add()
     A_TrayMenu.Add("Copy last text", (*) => CopyLast())
-    A_TrayMenu.Add("Open history", (*) => OpenHistory())
+    A_TrayMenu.Add("History...", (*) => ShowHistory(false))
+    A_TrayMenu.Add("Open history file", (*) => OpenHistory())
     A_TrayMenu.Add()
     A_TrayMenu.Add("Autostart", (*) => ToggleAutostart())   ; shortcut in the Startup folder
     A_TrayMenu.Add()
@@ -307,15 +312,30 @@ CreateIndicator() {
     ; Thin border along that contour: DWMWA_BORDER_COLOR (34), COLORREF 0x00BBGGRR.
     try DllCall("dwmapi\DwmSetWindowAttribute", "ptr", Indicator.Hwnd, "uint", 34, "uint*", IndicatorBorder, "uint", 4)
     OnMessage 0x0201, OnIndicatorMouseDown   ; WM_LBUTTONDOWN: start dragging
+    OnMessage 0x0203, OnIndicatorDblClick    ; WM_LBUTTONDBLCLK: history
     OnMessage 0x0232, OnIndicatorMoved       ; WM_EXITSIZEMOVE: drag finished
     Indicator.OnEvent("ContextMenu", (*) => A_TrayMenu.Show())   ; right-click: same menu as the tray icon
 }
 
 ; Left button on the indicator: let Windows drag it as if by its title bar.
 OnIndicatorMouseDown(wParam, lParam, msg, hwnd) {
+    static lastDown := 0
     if (hwnd != Indicator.Hwnd)
         return
+    ; Second click within the double-click time: the history, not a drag.
+    if (A_TickCount - lastDown < DllCall("GetDoubleClickTime")) {
+        lastDown := 0
+        SetTimer () => ShowHistory(false), -10
+        return
+    }
+    lastDown := A_TickCount
     PostMessage 0x00A1, 2, 0, , Indicator      ; WM_NCLBUTTONDOWN, HTCAPTION
+}
+
+; The same double-click when Windows reports it as such (WM_LBUTTONDBLCLK).
+OnIndicatorDblClick(wParam, lParam, msg, hwnd) {
+    if (hwnd = Indicator.Hwnd)
+        SetTimer () => ShowHistory(false), -10
 }
 
 ; Drag finished: remember where it landed (percent of the primary work area).
@@ -587,6 +607,97 @@ CopyLast() {
 OpenHistory() {
     if FileExist(HistoryFile)
         Run 'notepad.exe "' HistoryFile '"'
+}
+
+; The last max texts of dictate-history.txt, newest first: {time, text}.
+; An entry is the text between two header lines "--- date time (N chars)".
+LoadHistory(max) {
+    items := []
+    try raw := FileRead(HistoryFile, "UTF-8")
+    catch
+        return items
+    heads := []
+    pos := 1
+    while (pos := RegExMatch(raw, "m`n)^--- (\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) \(\d+ chars\)\r?\n", &m, pos)) {
+        heads.Push({start: pos, body: pos + m.Len, time: m[1]})
+        pos += m.Len
+    }
+    Loop heads.Length {
+        i := heads.Length - A_Index + 1
+        stop := (i < heads.Length) ? heads[i + 1].start : StrLen(raw) + 1
+        text := Trim(SubStr(raw, heads[i].body, stop - heads[i].body), "`r`n")
+        if (text != "")
+            items.Push({time: heads[i].time, text: text})
+        if (items.Length >= max)
+            break
+    }
+    return items
+}
+
+; The history picker: the recent texts, newest first, the chosen one in full
+; below. Enter or a double-click pastes it into the window that was active
+; when the history key was pressed. Opened from the menu or by a double-click
+; on the indicator there is no such window, so it copies to the clipboard
+; instead. Part of a text can be selected in the lower box and copied as usual.
+ShowHistory(pasteHere) {
+    global HistGui
+    if Recording || Busy
+        return
+    target := 0
+    if pasteHere
+        try target := WinGetID("A")
+    items := LoadHistory(50)
+    if (items.Length = 0) {
+        SetIndicator("No history", "E05050", 2000)
+        return
+    }
+    CloseHistory()
+    g := Gui("+AlwaysOnTop +ToolWindow", "claude-dictate history")
+    g.SetFont("s10", "Segoe UI")
+    rows := []
+    for item in items
+        rows.Push(SubStr(item.time, 6, 11) "   " SubStr(RegExReplace(item.text, "\s+", " "), 1, 70))
+    list := g.AddListBox("w620 r12", rows)
+    full := g.AddEdit("w620 r7 ReadOnly")
+    pasteBtn := g.AddButton("w120 " (target ? "Default" : "Disabled"), "Paste")
+    copyBtn := g.AddButton("x+8 w120" (target ? "" : " Default"), "Copy")
+    g.AddText("x+12 yp+6 c808080", "Enter: " (target ? "paste" : "copy") "    Esc: close")
+    showFull := (*) => full.Value := (list.Value ? items[list.Value].text : "")
+    list.OnEvent("Change", showFull)
+    list.OnEvent("DoubleClick", (*) => HistoryPick(items, list.Value, target))
+    pasteBtn.OnEvent("Click", (*) => HistoryPick(items, list.Value, target))
+    copyBtn.OnEvent("Click", (*) => HistoryPick(items, list.Value, 0))
+    g.OnEvent("Escape", (*) => CloseHistory())
+    g.OnEvent("Close", (*) => CloseHistory())
+    list.Choose(1)
+    showFull()
+    HistGui := g
+    g.Show()
+    list.Focus()
+}
+
+CloseHistory() {
+    global HistGui
+    if HistGui {
+        try HistGui.Destroy()
+        HistGui := 0
+    }
+}
+
+; Paste the chosen text into target, or copy it when there is no target.
+HistoryPick(items, index, target) {
+    if (index < 1)
+        return
+    text := items[index].text
+    CloseHistory()
+    if !target {
+        A_Clipboard := text
+        SetIndicator("✓ copied", "60C060", 1500)
+    } else if PasteText(text, target) {
+        LogEvent("pasted " StrLen(text) " chars from the history")
+        SetIndicator("✓ pasted", "60C060", 1500)
+    } else
+        SetIndicator("No paste", "E05050", 2000)
 }
 
 ; A text can arrive after the script stopped waiting for it (slow network, a

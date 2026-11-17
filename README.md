@@ -77,6 +77,8 @@ closes together with the script.
 | Ctrl+Space again | stop and paste the text into the window you started in |
 | Escape while recording | cancel, paste nothing |
 | Ctrl+Shift+Space | paste the last dictated text again, into the active window |
+| Ctrl+Alt+Space | history: the last 50 texts, newest first; Enter pastes the chosen one into the window you were in |
+| Double-click the indicator | the same history; Enter copies to the clipboard |
 
 Outside of a recording the script does not touch Escape. The clipboard is restored after pasting.
 
