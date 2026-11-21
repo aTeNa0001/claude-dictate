@@ -1104,7 +1104,20 @@ StartClaudeWindow() {
     EnvSet "CLAUDE_CODE_USE_VERTEX"
     EnvSet "CLAUDE_CODE_USE_FOUNDRY"
 
-    Run 'conhost.exe "' ClaudeExe '" --settings "' Settings '"', A_ScriptDir, , &conhostPid
+    ; Started from inside another Claude Code session (a terminal of it, an
+    ; agent), the script inherits that session's variables and would hand them
+    ; down: the dictation instance then takes itself for a child of that
+    ; session ("Transcript saving is off - inherited ...") and loads its plugins.
+    for name in ["CLAUDECODE", "CLAUDE_PID", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_SESSION_ID",
+                 "CLAUDE_CODE_SESSION_ATTENDED", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_MESSAGING_SOCKET",
+                 "CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_CODE_PLUGIN_DIRS"]
+        EnvSet name
+
+    ; Hidden or minimized from the first moment, not only after Claude Code
+    ; has drawn its prompt: otherwise the console shows up for five seconds on
+    ; every start and takes the focus.
+    showOption := (WindowMode = "hidden") ? "Hide" : (WindowMode = "minimized") ? "Min" : ""
+    Run 'conhost.exe "' ClaudeExe '" --settings "' Settings '"', A_ScriptDir, showOption, &conhostPid
     if (inheritedConfigDir != "")
         EnvSet "CLAUDE_CONFIG_DIR", inheritedConfigDir
     else
