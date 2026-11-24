@@ -52,6 +52,8 @@ global PreviewOn         := Cfg("preview", 1)              ; live transcript nex
 global PreviewChars      := Cfg("previewChars", 60)         ; how much of its end is shown
 global SoundsOn          := Cfg("sounds", 1)                ; audio cues
 global SoundVolume       := Cfg("soundVolume", 25)          ; 0..100
+global IndHideIdle       := Cfg("indicatorHideIdle", 0)     ; 1 = hide the indicator while idle
+global IndicatorKey      := Cfg("indicatorKey", "^!h")      ; toggles indicatorHideIdle; "" = off
 
 Cfg(key, default) {
     return IniRead(StateIni, "settings", key, default)
@@ -150,6 +152,8 @@ try {
         Hotkey RepasteKey, (*) => RepasteLast()
     if (HistoryKey != "")
         Hotkey HistoryKey, (*) => ShowHistory(true)
+    if (IndicatorKey != "")
+        Hotkey IndicatorKey, (*) => ToggleIndicatorHide()
     HotIf (*) => Recording
     Hotkey HotkeyCancel, (*) => CancelDictation()
     HotIf
@@ -177,12 +181,48 @@ CreateTrayMenu() {
     A_TrayMenu.Add("History...", (*) => ShowHistory(false))
     A_TrayMenu.Add("Open history file", (*) => OpenHistory())
     A_TrayMenu.Add()
+    A_TrayMenu.Add("Hide indicator when idle", (*) => ToggleIndicatorHide())
     A_TrayMenu.Add("Autostart", (*) => ToggleAutostart())   ; shortcut in the Startup folder
     A_TrayMenu.Add()
     A_TrayMenu.Add("Reload", (*) => Restart())   ; re-read this file, restart Claude Code
     A_TrayMenu.Add("Exit", (*) => ExitApp())
     MarkWindowMode()
     MarkAutostart()
+    MarkIndicatorHide()
+}
+
+MarkIndicatorHide() {
+    if IndHideIdle
+        A_TrayMenu.Check("Hide indicator when idle")
+    else
+        A_TrayMenu.Uncheck("Hide indicator when idle")
+}
+
+; Hotkey / menu: hide the indicator while idle (it still appears while recording
+; and processing), or keep it always on screen. Remembered in dictate.ini.
+ToggleIndicatorHide() {
+    global IndHideIdle
+    IndHideIdle := !IndHideIdle
+    IniWrite IndHideIdle, StateIni, "settings", "indicatorHideIdle"
+    MarkIndicatorHide()
+    UpdateIndicatorVisibility()
+    LogEvent("indicator hide when idle: " IndHideIdle)
+}
+
+; Hidden only when idle and indicatorHideIdle is on; every other state is shown.
+UpdateIndicatorVisibility() {
+    if !Indicator
+        return
+    idle := (IndState.text = "○ ready" || IndState.text = "↻ updated")
+    try {
+        visible := DllCall("IsWindowVisible", "ptr", Indicator.Hwnd)
+        if (IndHideIdle && idle) {
+            if visible
+                Indicator.Hide()
+        } else if !visible {
+            Indicator.Show("NoActivate")
+        }
+    }
 }
 
 ; Last folder name of the config dir, or "default".
@@ -322,6 +362,7 @@ CreateIndicator() {
     OnMessage 0x0203, OnIndicatorDblClick    ; WM_LBUTTONDBLCLK: history
     OnMessage 0x0232, OnIndicatorMoved       ; WM_EXITSIZEMOVE: drag finished
     Indicator.OnEvent("ContextMenu", (*) => A_TrayMenu.Show())   ; right-click: same menu as the tray icon
+    UpdateIndicatorVisibility()
 }
 
 ; Left button on the indicator: let Windows drag it as if by its title bar.
@@ -746,6 +787,7 @@ SetIndicator(text, color, resetMs := 0) {
     IndState.color := color
     IndText.Opt("c" color)
     IndText.Text := text
+    UpdateIndicatorVisibility()
     if (resetMs > 0)
         SetTimer IndicatorIdle, -resetMs
     else
